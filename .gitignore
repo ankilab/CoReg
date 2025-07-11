@@ -1,9 +1,9 @@
 ############### Customize python .gitignore ################
 
-cotracker/
-output/
-input/
-assets/
+cotracker/*
+output/*
+input/*
+assets/*
 
 
 # Byte-compiled / optimized / DLL files

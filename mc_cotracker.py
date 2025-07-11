@@ -21,25 +21,29 @@ DEFAULT_DEVICE = (
     "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 )
 
-def load_video(file, size=(256,256)):
+def load_video(file, resize=True):
     """
     Load a video from the given file path, resize it to the specified size,
     and return the video tensor and frames. 
     args:
         file (str): Path to the video file.
-        size (tuple): Desired size for the video frames (width, height).
+        resize: Flag to indicate whether to resize the video frames.
     returns:
         video (torch.Tensor): A tensor containing the video frames, resized to the specified size.
-        video_frames (list): A list of resized video frames as numpy arrays.
     """
-    video_path = file
-    video = read_video_from_path(video_path)
-    video_frames = [cv2.resize(frame, size) for frame in video]
-    video = torch.from_numpy(video).permute(0, 3, 1, 2).float()
     
-    video = F.interpolate(video, size=size, mode='bilinear', align_corners=False)[None]
+    video = read_video_from_path(file)
+    if resize:
+        size = (256, 256) 
+        video = np.array([cv2.resize(frame, size) for frame in video])
+    else:
+        video = np.array([frame for frame in video])
+        size = video.shape[2:4]
 
-    return video, video_frames
+    video = torch.from_numpy(video).permute(0, 3, 1, 2).float()
+    #video = F.interpolate(video, size=size, mode='bilinear', align_corners=False)[None]
+
+    return video
 
 def cotrack_model(video, grid_size):
     """"Run the CoTracker model on the provided video and grid points.
@@ -61,17 +65,21 @@ def cotrack_model(video, grid_size):
     model = torch.hub.load("facebookresearch/co-tracker", "cotracker3_offline").to("cuda")
     model = model.to(DEFAULT_DEVICE)
     video = video.to(DEFAULT_DEVICE)
-    model.model.model_resolution = video.shape[3:]
+
+    model.model.model_resolution = video.shape[2:]
+    print(video.shape[2:])
+  
     grid_pts = get_points_on_a_grid(
                 grid_size, model.model.model_resolution
             )
 
     pred_tracks, pred_visibility = model(
-        video,
+        video.unsqueeze(0).to(DEFAULT_DEVICE),
         grid_size=grid_size,
         grid_query_frame=0,
         backward_tracking=False
     )
+
     return pred_tracks, pred_visibility, grid_pts
 
 def warping(predicted_tracks, frames):      
@@ -83,6 +91,7 @@ def warping(predicted_tracks, frames):
     returns:
         warpeds (list): List of warped frames.
     """
+    frames = frames.transpose(0,2,3,1) 
     T_orig, H, W, C = frames.shape
     B, T, G, D = predicted_tracks.shape
     grid_size = int(math.sqrt(G))
@@ -99,7 +108,7 @@ def warping(predicted_tracks, frames):
         grid_x = grid_x.astype(np.float32)
         grid_y = grid_y.astype(np.float32)
 
-        phi = np.diff(vp,axis=0)[0:i].sum(0)
+        phi = np.diff(vp,axis=0)[0:i].sum(0).transpose(0,2,1)
         grid_x += phi[0]
         grid_y += phi[1]
   
@@ -136,7 +145,7 @@ if __name__ == "__main__":
     torch.cuda.empty_cache()
     
     #define the video file path
-    video_file = "/home/rzlin/va11moje/co-tracker/input/Drosophila_Ca_bad.avi"
+    video_file = "/home/rzlin/va11moje/bimap_registration/input/Drosophila_Ca_bad.avi"
     filename = (video_file.split('/')[-1].split('.')[0])
     if not os.path.exists(video_file):
         print(f"Video file {video_file} does not exist.")
@@ -146,7 +155,7 @@ if __name__ == "__main__":
     # Apply motion correction algorithm by
     # loading the video, running the CoTracker model, and warping the frames
 
-    vid = load_video(video_file, size=(256, 256))
-    pred_tracks = cotrack_model(vid[0], grid_size=20)
-    result = warping(pred_tracks[0].cpu().numpy(), np.array(vid[1]))
+    vid = load_video(video_file, resize=False)
+    pred_tracks = cotrack_model(vid, grid_size=25)
+    result = warping(pred_tracks[0].cpu().numpy(), np.array(vid))
     save_and_display_video(np.array(result), f'output/{filename}_registered.mp4', fps=15)
