@@ -1,6 +1,6 @@
-# bimap_registration
+# registration_gui
 
-BiMap Registration is a small collection of Python tools for video motion-correction and image registration. This repository contains three main approaches to register a video sequence to a single reference frame:
+Registration GUI is a small collection of Python tools for video motion-correction and image registration. This repository contains three main approaches to register a video sequence to a single reference frame:
 
 - CoTracker-based motion tracking and scattered warping (fast learned trajectories): `mc_cotracker.py` + interactive GUI in `gui.py`.
 - ANTs-based pairwise SyN registration: `ants_register.py` (ANTsPy wrapper).
