@@ -45,7 +45,7 @@ def load_video(file, resize=True):
 
     return video
 
-def cotrack_model(video, grid_size):
+def cotrack_model(video, queries, grid_size=0):
     """"Run the CoTracker model on the provided video and grid points.
     Model defines which cotracker model is used for tracking.
     args:
@@ -65,56 +65,154 @@ def cotrack_model(video, grid_size):
     model = torch.hub.load("facebookresearch/co-tracker", "cotracker3_offline").to("cuda")
     model = model.to(DEFAULT_DEVICE)
     video = video.to(DEFAULT_DEVICE)
-
     model.model.model_resolution = video.shape[2:]
-    print(video.shape[2:])
-  
-    grid_pts = get_points_on_a_grid(
-                grid_size, model.model.model_resolution
-            )
 
     pred_tracks, pred_visibility = model(
         video.unsqueeze(0).to(DEFAULT_DEVICE),
-        grid_size=grid_size,
-        grid_query_frame=0,
+        queries=queries.to(DEFAULT_DEVICE),
+        grid_size=0,
+        grid_query_frame=0,      # ignored when queries is provided, but fine to keep
         backward_tracking=False
     )
 
-    return pred_tracks, pred_visibility, grid_pts
+    return pred_tracks, pred_visibility
 
-def warping(predicted_tracks, frames):      
-    """
-    Warps the frames of a video based on predicted tracks.
-    args:       
-        predicted_tracks (torch.Tensor): Predicted tracks of shape (B, T, G, D).
-        frames (torch.Tensor): Video frames of shape (T_orig, H, W, C).
-    returns:
-        warpeds (list): List of warped frames.
-    """
-    frames = frames.transpose(0,2,3,1) 
-    T_orig, H, W, C = frames.shape
-    B, T, G, D = predicted_tracks.shape
-    grid_size = int(math.sqrt(G))
 
-    velocity = predicted_tracks[0].reshape(T, grid_size, grid_size, 2) #(24, 32, 32, 2)
-    real_velocity = velocity-velocity[0] # (24, 32, 32, 2)
-    v = real_velocity.transpose(0, 3, 1, 2) # (24, 2, 32, 32)
-    vp = zoom(v, (1, 1, W/grid_size, H/grid_size))  #(24, 2, 256, 256) 
+### uniform grid warping
+# def warping(predicted_tracks, frames):      
+#     """
+#     Warps the frames of a video based on predicted tracks.
+#     args:       
+#         predicted_tracks (torch.Tensor): Predicted tracks of shape (B, T, G, D).
+#         frames (torch.Tensor): Video frames of shape (T_orig, H, W, C).
+#     returns:
+#         warpeds (list): List of warped frames.
+#     """
+#     frames = frames.transpose(0,2,3,1) 
+#     T_orig, H, W, C = frames.shape
+#     B, T, G, D = predicted_tracks.shape
+#     print("predicted_tracks.shape", predicted_tracks.shape)
+#     grid_size = int(math.sqrt(G))
+
+#     velocity = predicted_tracks[0].reshape(T, grid_size, grid_size, 2) #(24, 32, 32, 2)
+#     real_velocity = velocity-velocity[0] # (24, 32, 32, 2)
+#     v = real_velocity.transpose(0, 3, 1, 2) # (24, 2, 32, 32)
+#     vp = zoom(v, (1, 1, W/grid_size, H/grid_size))  #(24, 2, 256, 256) 
         
-    warpeds = [frames[0][...,0]]
+#     warpeds = [frames[0][...,0]]
 
-    for i in range(1,T_orig):
-        grid_x, grid_y = np.meshgrid(np.arange(W), np.arange(H))
-        grid_x = grid_x.astype(np.float32)
-        grid_y = grid_y.astype(np.float32)
+#     for i in range(1,T_orig):
+#         grid_x, grid_y = np.meshgrid(np.arange(W), np.arange(H))
+#         grid_x = grid_x.astype(np.float32)
+#         grid_y = grid_y.astype(np.float32)
 
-        phi = np.diff(vp,axis=0)[0:i].sum(0).transpose(0,2,1)
-        grid_x += phi[0]
-        grid_y += phi[1]
+#         phi = np.diff(vp,axis=0)[0:i].sum(0).transpose(0,2,1)
+#         grid_x += phi[0]
+#         grid_y += phi[1]
   
-        warped = map_coordinates(frames[i][...,0].astype(np.float32), [grid_y, grid_x], order=3, mode='nearest')
-        warpeds.append(warped)
+#         warped = map_coordinates(frames[i][...,0].astype(np.float32), [grid_y, grid_x], order=3, mode='nearest')
+#         warpeds.append(warped)
        
+#     return np.array(warpeds)
+
+
+
+def warping(predicted_tracks, frames):
+    """
+    Non-uniform-grid warping via scattered interpolation.
+
+    args:
+        predicted_tracks: (B, T, N, 2) in (x,y) as torch.Tensor or np.ndarray
+        frames: video as torch.Tensor or np.ndarray
+            supported: (T,C,H,W) or (T,H,W,C) or (T,H,W)
+
+    returns:
+        np.ndarray of warped frames, shape (T, H, W)  (warps channel 0 like your original)
+    """
+    # ---- to numpy ----
+    if "torch" in str(type(predicted_tracks)):
+        predicted_tracks = predicted_tracks.detach().cpu().numpy()
+    if "torch" in str(type(frames)):
+        frames = frames.detach().cpu().numpy()
+
+    tracks = np.asarray(predicted_tracks)
+    if tracks.ndim != 4 or tracks.shape[-1] != 2:
+        raise ValueError(f"predicted_tracks must be (B,T,N,2), got {tracks.shape}")
+
+    # ---- normalize frames to (T,H,W,C) or (T,H,W) ----
+    if frames.ndim == 4 and frames.shape[1] in (1, 3):          # (T,C,H,W)
+        frames = frames.transpose(0, 2, 3, 1)                    # -> (T,H,W,C)
+    elif frames.ndim == 3:                                       # (T,H,W)
+        pass
+    elif frames.ndim == 4 and frames.shape[-1] in (1, 3):        # (T,H,W,C)
+        pass
+    else:
+        raise ValueError(f"Unsupported frames shape: {frames.shape}")
+
+    T_orig = frames.shape[0]
+    H = frames.shape[1]
+    W = frames.shape[2]
+
+    B, T, N, _ = tracks.shape
+    if B != 1:
+        raise ValueError("This implementation assumes B=1")
+    if T_orig > T:
+        raise ValueError(f"frames has {T_orig} frames but predicted_tracks has only {T} timesteps")
+
+    # Reference point positions (frame 0)
+    p_ref_all = tracks[0, 0].astype(np.float32)  # (N,2)
+
+    # Pixel grid (reference coordinates)
+    grid_x, grid_y = np.meshgrid(np.arange(W, dtype=np.float32),
+                                 np.arange(H, dtype=np.float32))
+
+    # Keep your original output style: first frame unchanged, single channel
+    if frames.ndim == 4:
+        warpeds = [frames[0][..., 0]]
+    else:
+        warpeds = [frames[0]]
+
+    for i in range(1, T_orig):
+        p_src_all = tracks[0, i].astype(np.float32)  # (N,2)
+
+        # drop invalid points
+        good = np.isfinite(p_ref_all).all(axis=1) & np.isfinite(p_src_all).all(axis=1)
+        p_ref = p_ref_all[good]
+        p_src = p_src_all[good]
+
+        if p_ref.shape[0] < 3:
+            # too few points => identity warp fallback
+            warpeds.append(frames[i][..., 0] if frames.ndim == 4 else frames[i])
+            continue
+
+        # Displacement field defined at reference points: d(p_ref) = p_src - p_ref
+        disp = (p_src - p_ref).astype(np.float32)  # (M,2)
+
+        # Interpolate dx/dy over full image grid
+        dx = griddata(p_ref, disp[:, 0], (grid_x, grid_y), method="linear", fill_value=np.nan)
+        dy = griddata(p_ref, disp[:, 1], (grid_x, grid_y), method="linear", fill_value=np.nan)
+
+        # Fill outside convex hull using nearest neighbor
+        nan = np.isnan(dx) | np.isnan(dy)
+        if np.any(nan):
+            dx_nn = griddata(p_ref, disp[:, 0], (grid_x, grid_y), method="nearest")
+            dy_nn = griddata(p_ref, disp[:, 1], (grid_x, grid_y), method="nearest")
+            dx[nan] = dx_nn[nan]
+            dy[nan] = dy_nn[nan]
+
+        # Build sampling coordinates (like your original grid_x/grid_y += phi)
+        sample_x = grid_x + dx
+        sample_y = grid_y + dy
+
+        src = frames[i][..., 0] if frames.ndim == 4 else frames[i]
+        warped = map_coordinates(
+            src.astype(np.float32),
+            [sample_y, sample_x],
+            order=3,
+            mode="nearest",
+        )
+        warpeds.append(warped)
+
     return np.array(warpeds)
 
 

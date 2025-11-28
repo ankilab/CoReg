@@ -35,7 +35,7 @@ def load_hdf5(h5_path, dataset_path, frames: int = 200, resize=True):
         size = (256, 256) 
         video = np.array([cv2.resize(frame, size) for frame in video])
 
-    return video
+    return video[:20]
 
 def load_tiff(path, page: int = 0, vmin=None, vmax=None, frames: int = 100):
     mm = tifffile.memmap(path)
@@ -49,7 +49,7 @@ def load_tiff(path, page: int = 0, vmin=None, vmax=None, frames: int = 100):
     else:
         video = mm     # plain 2D image
     
-    return np.array(video)
+    return np.array(video)[:20]
 
 def load_video(file, resize=True):
     """
@@ -73,7 +73,7 @@ def load_video(file, resize=True):
     video = torch.from_numpy(video).permute(0, 3, 1, 2).float()
     #video = F.interpolate(video, size=size, mode='bilinear', align_corners=False)[None]
 
-    return video
+    return video[:20]
 
 def save_and_display_video(array, filename='output.mp4', fps=30):
     num_frames, height, width = array.shape
