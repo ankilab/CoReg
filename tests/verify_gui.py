@@ -78,9 +78,9 @@ class TestMotionCorrectionGUI(unittest.TestCase):
         # But run_processing starts a thread.
         # We can test that it starts the thread.
         
-        with patch('gui.ProcessingThread') as MockThread:
+        with patch('gui.ProcessingWorker') as MockWorker:
             gui.run_processing()
-            MockThread.assert_called()
+            MockWorker.assert_called()
             print("Processing trigger verified")
 
 if __name__ == '__main__':
