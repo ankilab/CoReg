@@ -45,7 +45,7 @@ def load_video(file, resize=True):
     video = torch.from_numpy(video).permute(0, 3, 1, 2).float()
     #video = F.interpolate(video, size=size, mode='bilinear', align_corners=False)[None]
 
-    return video
+    return video[:10]
 
 def cotrack_model(video, queries, grid_size=0):
     """"Run the CoTracker model on the provided video and grid points.
@@ -69,10 +69,11 @@ def cotrack_model(video, queries, grid_size=0):
     video = video.to(DEFAULT_DEVICE)
     model.model.model_resolution = video.shape[2:]
 
+    
     pred_tracks, pred_visibility = model(
         video.unsqueeze(0).to(DEFAULT_DEVICE),
         queries=queries.to(DEFAULT_DEVICE),
-        grid_size=0,
+        grid_size=grid_size,
         grid_query_frame=0,      # ignored when queries is provided, but fine to keep
         backward_tracking=False
     )
@@ -119,116 +120,111 @@ def cotrack_model(video, queries, grid_size=0):
 
 
 
-def warping(predicted_tracks, frames):
+def warping(predicted_tracks, frames,
+            random=True, predicted=False):
     """
+    predicted_tracks: (B, T, G, 2)
+    frames: torch or np, shape (T, C, H, W) or (T, H, W, C)
+
     Returns:
-        warpeds: (T,H,W) float32
-        phis:    (T,H,W,2) float32  where phis[t,...] = (dx,dy) mapping ref->frame_t
+        warpeds: (T, H, W) float32 (channel-0)
+        phis:    (T-1, H, W, 2) float32  displacement field (dx,dy) from frame0 -> frame i
     """
-    if "torch" in str(type(predicted_tracks)):
+    # ---- to numpy ----
+    if torch.is_tensor(predicted_tracks):
         predicted_tracks = predicted_tracks.detach().cpu().numpy()
-    if "torch" in str(type(frames)):
+    if torch.is_tensor(frames):
         frames = frames.detach().cpu().numpy()
 
     tracks = np.asarray(predicted_tracks)
-    if tracks.ndim != 4 or tracks.shape[-1] != 2:
-        raise ValueError(f"predicted_tracks must be (B,T,N,2), got {tracks.shape}")
-
     frames = np.asarray(frames)
-    if frames.ndim == 4 and frames.shape[1] in (1, 3):  # (T,C,H,W)
-        frames = frames.transpose(0, 2, 3, 1)            # (T,H,W,C)
-    elif frames.ndim == 3:                               # (T,H,W)
-        pass
-    elif frames.ndim == 4 and frames.shape[-1] in (1, 3):# (T,H,W,C)
-        pass
+
+    # ---- normalize frames shape ----
+    if frames.ndim == 4 and frames.shape[1] in (1, 3):   # (T,C,H,W)
+        T_orig, C, H, W = frames.shape
+        frame0_gray = frames[0, 0].astype(np.float32)
+        get_frame_gray = lambda i: frames[i, 0].astype(np.float32)
+    elif frames.ndim == 4 and frames.shape[-1] in (1, 3): # (T,H,W,C)
+        T_orig, H, W, C = frames.shape
+        frame0_gray = frames[0, ..., 0].astype(np.float32)
+        get_frame_gray = lambda i: frames[i, ..., 0].astype(np.float32)
     else:
         raise ValueError(f"Unsupported frames shape: {frames.shape}")
 
-    T_orig, H, W = frames.shape[0], frames.shape[1], frames.shape[2]
+    B, T, G, D = tracks.shape
+    if D != 2:
+        raise ValueError(f"predicted_tracks last dim must be 2, got {D}")
+    grid_size = int(math.sqrt(G))
 
-    B, T, N, _ = tracks.shape
-    if B != 1:
-        raise ValueError("This implementation assumes B=1")
     if T_orig > T:
         raise ValueError(f"frames has {T_orig} frames but predicted_tracks has only {T} timesteps")
 
-    p_ref_all = tracks[0, 0].astype(np.float32)  # (N,2)
+    # ---- build dense displacement field vp: (T,2,H,W), displacement from t=0 ----
+    if random:
+        sparse_x = tracks[0, :, :, 0]  # (T, G)
+        sparse_y = tracks[0, :, :, 1]  # (T, G)
+        disp_sparse = tracks[0] - tracks[0, 0]  # (T, G, 2)
 
-    grid_x, grid_y = np.meshgrid(np.arange(W, dtype=np.float32),
-                                 np.arange(H, dtype=np.float32))
+        X, Y = np.meshgrid(np.arange(W), np.arange(H))  # (H,W)
+        dx_dense = np.zeros((T, H, W), dtype=np.float32)
+        dy_dense = np.zeros((T, H, W), dtype=np.float32)
 
-    # store channel-0 if RGB
-    first = frames[0][..., 0] if frames.ndim == 4 else frames[0]
-    warpeds = [first.astype(np.float32)]
-    #phis = [np.zeros((H, W, 2), dtype=np.float32)]
+        for t in range(T):
+            dx_dense[t] = griddata(
+                (sparse_x[t], sparse_y[t]),
+                disp_sparse[t, :, 0],
+                (X, Y),
+                method="nearest",
+                fill_value=0
+            ).astype(np.float32)
+
+            dy_dense[t] = griddata(
+                (sparse_x[t], sparse_y[t]),
+                disp_sparse[t, :, 1],
+                (X, Y),
+                method="nearest",
+                fill_value=0
+            ).astype(np.float32)
+
+        vp = np.stack((dx_dense, dy_dense), axis=1)  # (T,2,H,W)
+
+    elif predicted:
+        v = tracks[0]
+        if v.ndim == 4 and v.shape[1] == 2:
+            vp = (v - v[0]).astype(np.float32)  # (T,2,H,W)
+        else:
+            v = v.reshape(T, grid_size, grid_size, 2)
+            v = (v - v[0]).transpose(0, 3, 1, 2)                      # (T,2,gs,gs)
+            vp = zoom(v, (1, 1, H / grid_size, W / grid_size)).astype(np.float32)
+    else:
+        v = tracks[0].reshape(T, grid_size, grid_size, 2)
+        v = (v - v[0]).transpose(0, 3, 1, 2)                          # (T,2,gs,gs)
+        vp = zoom(v, (1, 1, H / grid_size, W / grid_size)).astype(np.float32)  # (T,2,H,W)
+
+    grid_x0, grid_y0 = np.meshgrid(np.arange(W, dtype=np.float32),
+                                   np.arange(H, dtype=np.float32))
+
+    warpeds = [frame0_gray]
     phis = []
-    velo = []
-
-    sparse_x = tracks[0, :, :, 0]  
-    sparse_y = tracks[0, :, :, 1]  
-    displacement = tracks[0] - tracks[0, 0]  # (T, G, 2)
-    X, Y = np.meshgrid(W,H)
-    dx_dense = np.zeros((T, H, W))
-    dy_dense = np.zeros((T, H, W))
-    for t in range(T):
-        dx_dense[t] = griddata(
-            (sparse_x[t], sparse_y[t]), displacement[t, :, 0], (X, Y), method='nearest', fill_value=0
-        )    
-        dy_dense[t] = griddata(
-            (sparse_x[t], sparse_y[t]), displacement[t, :, 1], (X, Y), method='nearest', fill_value=0
-        )
-    # Stack dx and dy to calculate v
-    vp = np.stack((dx_dense, dy_dense), axis=1)
-    print(vp.shape)
+    phis.append(np.zeros((H, W, 2), dtype=np.float32))
 
     for i in range(1, T_orig):
-        p_src_all = tracks[0, i].astype(np.float32)
 
-        good = np.isfinite(p_ref_all).all(axis=1) & np.isfinite(p_src_all).all(axis=1)
-        p_ref = p_ref_all[good]
-        p_src = p_src_all[good]
+        phi = vp[i]  # (2,H,W) displacement from t=0
+        phis.append(np.stack([phi[0], phi[1]], axis=-1))  # (H,W,2)
 
-        if p_ref.shape[0] < 3:
-            src = frames[i][..., 0] if frames.ndim == 4 else frames[i]
-            warpeds.append(src.astype(np.float32))
-            #phis.append(phis[-1].copy())
-            continue
+        sample_x = grid_x0 + phi[0]
+        sample_y = grid_y0 + phi[1]
 
-        disp = (p_src - p_ref).astype(np.float32)  # dx,dy at ref points
-
-        dx = griddata(p_ref, disp[:, 0], (grid_x, grid_y), method="linear",  fill_value=0)#fill_value=np.nan)
-        dy = griddata(p_ref, disp[:, 1], (grid_x, grid_y), method="linear",  fill_value=0)#fill_value=np.nan)
-        
-        phi = np.diff(vp,axis=0)[0:i].sum(0)      
-        phis.append(phi)
-
-        u = vp[i, 0]  # dx
-        v = vp[i, 0]  # dy
-        velo.append(np.sqrt(u**2 + v**2))
-
-        nan = np.isnan(dx) | np.isnan(dy)
-        if np.any(nan):
-            dx_nn = griddata(p_ref, disp[:, 0], (grid_x, grid_y), method="nearest")
-            dy_nn = griddata(p_ref, disp[:, 1], (grid_x, grid_y), method="nearest")
-            dx[nan] = dx_nn[nan]
-            dy[nan] = dy_nn[nan]
-
-        sample_x = grid_x + dx
-        sample_y = grid_y + dy
-
-        src = frames[i][..., 0] if frames.ndim == 4 else frames[i]
         warped = map_coordinates(
-            src.astype(np.float32),
+            get_frame_gray(i),
             [sample_y, sample_x],
             order=3,
-            mode="nearest",
-        )
-        warpeds.append(warped.astype(np.float32))
-    print(np.array(velo).shape)
+            mode="nearest"
+        ).astype(np.float32)
+        warpeds.append(warped)
 
-    return np.asarray(warpeds, dtype=np.float32), np.array(velo)
-
-
+    return np.asarray(warpeds, dtype=np.float32), np.asarray(phis, dtype=np.float32)
 
 
 
@@ -255,11 +251,13 @@ def save_and_display_video(array, filename='output.mp4', fps=30):
     print(f"Video saved to {filename}")
 
 
+
+
 if __name__ == "__main__":
     torch.cuda.empty_cache()
     
-    #define the video file path
-    video_file = "/home/rzlin/va11moje/bimap_registration/input/Drosophila_Ca_bad.avi"
+    #define the video file pat
+    video_file = r"C:\Users\luisa\Desktop\drosophila\Drosophila_Ca_bad.avi"
     filename = (video_file.split('/')[-1].split('.')[0])
     if not os.path.exists(video_file):
         print(f"Video file {video_file} does not exist.")
@@ -270,6 +268,13 @@ if __name__ == "__main__":
     # loading the video, running the CoTracker model, and warping the frames
 
     vid = load_video(video_file, resize=False)
-    pred_tracks = cotrack_model(vid, grid_size=25)
-    result = warping(pred_tracks[0].cpu().numpy(), np.array(vid))
-    save_and_display_video(np.array(result), f'output/{filename}_registered.mp4', fps=15)
+
+    queries = get_points_on_a_grid(5, vid.shape[2:])
+    xy = queries  # (1,16,2)
+    t = torch.zeros((*xy.shape[:-1], 1), device=xy.device, dtype=xy.dtype)      # (1,16,1)
+    txy = torch.cat([t, xy], dim=-1)  # (1,16,3)
+    pred_tracks = cotrack_model(vid, txy, grid_size=4)
+    result,velo = warping(pred_tracks[0].cpu().numpy(), np.array(vid))
+    
+    save_and_display_video(np.array(result), f'output/registered.mp4', fps=15)
+ 
