@@ -37,43 +37,62 @@ def load_hdf5(h5_path, dataset_path, frames: int = 200, resize=True):
 
     return video[:20]
 
-def load_tiff(path, page: int = 0, vmin=None, vmax=None, frames: int = 100):
+def load_tiff(path, frames: int = 50):
     mm = tifffile.memmap(path)
     print("shape:", mm.shape)
     print("dtype:", mm.dtype)
-    video = []
-    # Example 1: show a single slice from a 3D stack
+
     if mm.ndim == 3:
-        for i in range(frames):
-            video.append(mm[i])
+        T = min(int(frames), mm.shape[0])
+        # Convert each frame to native-endian uint16 (contiguous)
+        video = np.stack([np.array(mm[i], dtype=np.uint16) for i in range(T)], axis=0)
+    elif mm.ndim == 2:
+        video = np.array(mm, dtype=np.uint16)[None, ...]  # make it (1,H,W)
     else:
-        video = mm     # plain 2D image
-    
-    return np.array(video)[:20]
+        raise ValueError(f"Unsupported TIFF ndim={mm.ndim} with shape={mm.shape}")
 
-def load_video(file, resize=True):
+    return video
+
+def load_video(file: str, resize: bool = True, size=(256, 256), max_frames: int = 20):
     """
-    Load a video from the given file path, resize it to the specified size,
-    and return the video tensor and frames. 
-    args:
-        file (str): Path to the video file.
-        resize: Flag to indicate whether to resize the video frames.
-    returns:
-        video (torch.Tensor): A tensor containing the video frames, resized to the specified size.
+    Load a video from the given file path and return a torch tensor (T, C, H, W).
+
+    Args:
+        file: Path to the video file.
+        resize: If True, resize frames to `size`.
+        size: (W, H) target size for cv2.resize.
+        max_frames: Limit number of frames loaded/returned.
+
+    Returns:
+        video: torch.FloatTensor of shape (T, C, H, W)
     """
-    
-    video = read_video_from_path(file)
-    if resize:
-        size = (256, 256) 
-        video = np.array([cv2.resize(frame, size) for frame in video])
-    else:
-        video = np.array([frame for frame in video])
-        size = video.shape[2:4]
+    video = read_video_from_path(file)  # expected iterable/list/array of frames (H,W,C) or (H,W)
+    if video is None or len(video) == 0:
+        raise ValueError(f"No frames read from: {file}")
 
-    video = torch.from_numpy(video).permute(0, 3, 1, 2).float()
-    #video = F.interpolate(video, size=size, mode='bilinear', align_corners=False)[None]
+    # optionally cap early to avoid unnecessary work
+    if max_frames is not None:
+        video = video[:max_frames]
 
-    return video[:20]
+    frames = []
+    for frame in video:
+        f = np.asarray(frame)
+
+        # ensure 3 channels (H,W,3)
+        if f.ndim == 2:  # grayscale
+            f = cv2.cvtColor(f, cv2.COLOR_GRAY2RGB)
+        elif f.ndim == 3 and f.shape[2] == 4:  # RGBA -> RGB
+            f = f[..., :3]
+
+        if resize:
+            f = cv2.resize(f, size)  # size is (W,H) in OpenCV
+
+        frames.append(f)
+
+    video_np = np.ascontiguousarray(np.stack(frames, axis=0))  # (T,H,W,C)
+    video_t = torch.from_numpy(video_np).permute(0, 3, 1, 2).float()  # (T,C,H,W)
+
+    return video_t
 
 def save_and_display_video(array, filename='output.mp4', fps=30):
     num_frames, height, width = array.shape

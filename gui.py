@@ -485,6 +485,16 @@ class MotionCorrectionGUI(QMainWindow):
         self.init_ui()
         self.worker = None
 
+        self.current_filter = "None"
+        self.canny_low = 50
+        self.canny_high = 150
+        self.gauss_sigma = 1.2
+        self.sobel_ksize = 3
+
+
+   
+
+
     @staticmethod
     def flow_to_color(flow):
         # flow: (H, W, 2)
@@ -514,19 +524,25 @@ class MotionCorrectionGUI(QMainWindow):
             return np.asarray(self.pred_tracks)
 
     def init_ui(self):
-        central_widget = QWidget()
+        central_widget = QWidget(self)
         self.setCentralWidget(central_widget)
 
-        main_layout = QVBoxLayout()
-        central_widget.setLayout(main_layout)
+        main_layout = QVBoxLayout(central_widget)
+        main_layout.setContentsMargins(8, 8, 8, 8)
+        main_layout.setSpacing(8)
 
         # -----------------------------
-        # Create ALL controls FIRST
+        # Top controls
         # -----------------------------
+        controls = QWidget(central_widget)
+        controls_grid = QGridLayout(controls)
+        controls_grid.setContentsMargins(6, 6, 6, 6)
+        controls_grid.setHorizontalSpacing(8)
+        controls_grid.setVerticalSpacing(4)
+
         self.load_btn = QPushButton("Load File")
         self.load_btn.clicked.connect(self.select_file)
 
-        # Preset dropdown
         self.preset_combo = QComboBox()
         self.preset_combo.addItems([
             "Regular grid",
@@ -536,7 +552,11 @@ class MotionCorrectionGUI(QMainWindow):
         ])
         self.preset_combo.currentIndexChanged.connect(self.on_preset_changed)
 
-        # Preset params (non-grid)
+        self.filter_combo = QComboBox()
+        self.filter_combo.addItems(["None", "Gaussian", "Sobel", "Canny edge"])
+        self.filter_combo.currentIndexChanged.connect(self.on_filter_changed)
+
+        self.lbl_filter = QLabel("Filter:")
         self.num_points_spin = QSpinBox()
         self.num_points_spin.setRange(10, 5000)
         self.num_points_spin.setValue(400)
@@ -550,11 +570,9 @@ class MotionCorrectionGUI(QMainWindow):
         self.apply_preset_btn = QPushButton("Apply Preset")
         self.apply_preset_btn.clicked.connect(self.apply_point_preset)
 
-        # Grid-only params (enabled only when "Regular grid" is selected)
         self.grid_rows_ctrl = QLineEdit(str(getattr(self, "grid_rows", 4)))
         self.grid_cols_ctrl = QLineEdit(str(getattr(self, "grid_cols", 4)))
 
-        # Processing
         self.process_btn = QPushButton("Run Registration")
         self.process_btn.clicked.connect(self.run_processing)
         self.process_btn.setEnabled(False)
@@ -563,7 +581,6 @@ class MotionCorrectionGUI(QMainWindow):
         self.stop_btn.clicked.connect(self.stop_processing)
         self.stop_btn.setEnabled(False)
 
-        # Editing
         self.edit_points_btn = QCheckBox("Edit Points")
         self.edit_points_btn.stateChanged.connect(self.toggle_edit_mode)
         self.edit_points_btn.setEnabled(False)
@@ -574,18 +591,311 @@ class MotionCorrectionGUI(QMainWindow):
 
         self.undo_btn = QPushButton("Undo All")
         self.undo_btn.clicked.connect(self.undo_all_changes)
-        elif a.ndim == 3 and a.shape[2] == 3:
-            h, w, _ = a.shape
-            # Ensure format is RGB
-            qimg = QImage(a.data, w, h, 3 * w, QImage.Format.Format_RGB888)
-            pix = QPixmap.fromImage(qimg.copy())
-            return pix
+        self.undo_btn.setEnabled(False)
+
+        self.reset_zoom_btn = QPushButton("Reset Zoom")
+        self.reset_zoom_btn.clicked.connect(self.reset_all_zoom)
+
+        self.points_label = QLabel("Points: 0")
+        self.status_label = QLabel("Ready - Drag & drop video or use Load button")
+        self.status_label.setWordWrap(True)
+
+        self.lbl_N = QLabel("N:")
+        self.lbl_minDist = QLabel("MinDist:")
+        self.lbl_rows = QLabel("Rows:")
+        self.lbl_cols = QLabel("Cols:")
+
+        # Row 0
+        c = 0
+        controls_grid.addWidget(self.load_btn, 0, c); c += 1
+        controls_grid.addWidget(QLabel("Preset:"), 0, c); c += 1
+        controls_grid.addWidget(self.preset_combo, 0, c); c += 1
+
+        controls_grid.addWidget(self.lbl_N, 0, c); c += 1
+        controls_grid.addWidget(self.num_points_spin, 0, c); c += 1
+
+        controls_grid.addWidget(self.lbl_minDist, 0, c); c += 1
+        controls_grid.addWidget(self.min_dist_spin, 0, c); c += 1
+
+        controls_grid.addWidget(self.lbl_filter, 0, c); c += 1
+        controls_grid.addWidget(self.filter_combo, 0, c); c += 1
+
+        controls_grid.addWidget(self.lbl_rows, 0, c); c += 1
+        controls_grid.addWidget(self.grid_rows_ctrl, 0, c); c += 1
+        controls_grid.addWidget(self.lbl_cols, 0, c); c += 1
+        controls_grid.addWidget(self.grid_cols_ctrl, 0, c); c += 1
+
+        controls_grid.addWidget(self.apply_preset_btn, 0, c); c += 1
+        controls_grid.addWidget(self.process_btn, 0, c); c += 1
+        controls_grid.addWidget(self.stop_btn, 0, c); c += 1
+
+        ncols = c
+
+        # Row 1
+        c = 0
+        controls_grid.addWidget(self.edit_points_btn, 1, c); c += 1
+        controls_grid.addWidget(self.clear_points_btn, 1, c); c += 1
+        controls_grid.addWidget(self.undo_btn, 1, c); c += 1
+        controls_grid.addWidget(self.reset_zoom_btn, 1, c); c += 1
+        controls_grid.addWidget(self.points_label, 1, c); c += 1
+
+        # Row 2 status
+        controls_grid.addWidget(self.status_label, 2, 0, 1, ncols)
+
+        main_layout.addWidget(controls)
+
+        # -----------------------------
+        # 2x2 image grid
+        # -----------------------------
+        self.grid_widget = QWidget(central_widget)
+        self.grid_layout = QGridLayout(self.grid_widget)
+        self.grid_layout.setContentsMargins(6, 6, 6, 6)
+        self.grid_layout.setHorizontalSpacing(6)
+        self.grid_layout.setVerticalSpacing(6)
+        self.grid_layout.setRowStretch(0, 1)
+        self.grid_layout.setRowStretch(1, 1)
+        self.grid_layout.setColumnStretch(0, 1)
+        self.grid_layout.setColumnStretch(1, 1)
+
+        self.lbl_input_title = QLabel("Input")
+        self.lbl_input = ImageLabel()
+
+        self.lbl_grid_title = QLabel("Tracked Points")
+        self.lbl_grid = ImageLabel()
+
+        self.lbl_warped_title = QLabel("Corrected Video")
+        self.lbl_warped = ImageLabel()
+
+        self.lbl_tracks_title = QLabel("Deformation Field")
+        self.lbl_tracks = ImageLabel()
+
+        panels = [
+            (self.lbl_input_title, self.lbl_input),
+            (self.lbl_grid_title, self.lbl_grid),
+            (self.lbl_warped_title, self.lbl_warped),
+            (self.lbl_tracks_title, self.lbl_tracks),
+        ]
+        for i, (title, label) in enumerate(panels):
+            r, col = divmod(i, 2)
+            vbox = QVBoxLayout()
+            vbox.addWidget(title)
+            vbox.addWidget(label)
+            self.grid_layout.addLayout(vbox, r, col)
+
+        main_layout.addWidget(self.grid_widget, stretch=1)
+
+        # -----------------------------
+        # Playback row
+        # -----------------------------
+        playback_layout = QHBoxLayout()
+
+        self.play_btn = QPushButton("⏯️")
+        self.play_btn.clicked.connect(self.toggle_playback)
+        self.play_btn.setEnabled(False)
+
+        self.step_back_btn = QPushButton("◀")
+        self.step_back_btn.clicked.connect(self.step_backward)
+        self.step_back_btn.setEnabled(False)
+
+        self.step_fwd_btn = QPushButton("▶")
+        self.step_fwd_btn.clicked.connect(self.step_forward)
+        self.step_fwd_btn.setEnabled(False)
+
+        self.speed_slider = QSlider(Qt.Orientation.Horizontal)
+        self.speed_slider.setMinimum(10)
+        self.speed_slider.setMaximum(200)
+        self.speed_slider.setValue(100)
+        self.speed_slider.valueChanged.connect(self.on_speed_change)
+
+        self.speed_label = QLabel("1.00x")
+
+        self.slider = QSlider(Qt.Orientation.Horizontal)
+        self.slider.setMinimum(0)
+        self.slider.setMaximum(100)
+        self.slider.valueChanged.connect(self.on_slider_change)
+        self.slider.setEnabled(False)
+
+        self.frame_label = QLabel("0/0")
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+
+        playback_layout.addWidget(self.play_btn)
+        playback_layout.addWidget(self.step_back_btn)
+        playback_layout.addWidget(self.step_fwd_btn)
+        playback_layout.addWidget(self.speed_slider)
+        playback_layout.addWidget(self.speed_label)
+        playback_layout.addWidget(self.slider, stretch=1)
+        playback_layout.addWidget(self.frame_label)
+        playback_layout.addWidget(self.progress_bar)
+
+        main_layout.addLayout(playback_layout)
+
+        # Ensure correct visibility of preset controls immediately
+        self._update_preset_controls()
+
+        # Sanity: show something obvious even before loading a file
+        self.status_label.setText("UI loaded. Click 'Load File' or drag & drop a file.")
+
+
+    def on_filter_changed(self):
+        self.current_filter = self.filter_combo.currentText()
+        # update display immediately
+        self.visualize()
+
+    def _to_gray_float32(self, frame):
+        frame = np.asarray(frame)
+        if frame.ndim == 3 and frame.shape[2] == 3:
+            gray = frame[..., 0]
         else:
-            # Unknown shape, convert to grayscale
-            gray = a.mean(axis=-1).astype(np.uint8)
-            h, w = gray.shape
-            qimg = QImage(gray.data, w, h, w, QImage.Format.Format_Grayscale8)
+            gray = frame
+        return gray.astype(np.float32, copy=False)
+
+    def _normalize_to_u8(self, img_f):
+        img_f = np.asarray(img_f, dtype=np.float32)
+        mi = float(np.nanmin(img_f))
+        ma = float(np.nanmax(img_f))
+        if not np.isfinite(mi) or not np.isfinite(ma) or ma <= mi:
+            return np.zeros(img_f.shape, dtype=np.uint8)
+        out = (img_f - mi) / (ma - mi) * 255.0
+        return np.clip(out, 0, 255).astype(np.uint8)
+
+    def apply_filter(self, frame, filt: str):
+        """
+        frame: (H,W) or (H,W,3), float or uint.
+        returns: 2D uint8 image suitable for display + feature detection
+        """
+        if frame is None:
+            return None
+
+        f = np.asarray(frame)
+
+        # grayscale
+        if f.ndim == 3 and f.shape[2] == 3:
+            gray = f[..., 0]
+        else:
+            gray = f
+
+        # to uint8 0..255 for CV filters
+        if np.issubdtype(gray.dtype, np.floating):
+            g = gray.astype(np.float32)
+            mn, mx = float(np.nanmin(g)), float(np.nanmax(g))
+            if mx > mn:
+                g = (g - mn) / (mx - mn) * 255.0
+            gray_u8 = np.clip(g, 0, 255).astype(np.uint8)
+        else:
+            # handle uint16 etc
+            g = gray.astype(np.float32)
+            mn, mx = float(np.nanmin(g)), float(np.nanmax(g))
+            if mx > mn:
+                g = (g - mn) / (mx - mn) * 255.0
+            gray_u8 = np.clip(g, 0, 255).astype(np.uint8)
+
+        filt = (filt or "None").lower()
+
+        if filt in ("none", "raw"):
+            return gray_u8
+
+        if filt in ("gaus", "gaussian"):
+            return cv2.GaussianBlur(gray_u8, (0, 0), 1.2)
+
+        if filt in ("sobel",):
+            sx = cv2.Sobel(gray_u8, cv2.CV_32F, 1, 0, ksize=3)
+            sy = cv2.Sobel(gray_u8, cv2.CV_32F, 0, 1, ksize=3)
+            mag = cv2.magnitude(sx, sy)
+            return cv2.normalize(mag, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+        if filt in ("edge", "canny"):
+            return cv2.Canny(gray_u8, 50, 150)
+
+        return gray_u8
+
+    def _array_to_qpixmap(self, arr):
+        """Convert numpy array to QPixmap for display (supports float/uint16/uint8)."""
+        if arr is None:
+            return QPixmap()
+
+        a = np.asarray(arr)
+        a = np.ascontiguousarray(a)
+
+        # If RGB floats or ints, bring to uint8 for QImage
+        if a.ndim == 3 and a.shape[2] == 3:
+            if np.issubdtype(a.dtype, np.floating):
+                # robust percentile window for stable contrast
+                lo = np.percentile(a, 1.0)
+                hi = np.percentile(a, 99.0)
+                if hi <= lo:
+                    hi = lo + 1.0
+                a = np.clip((a - lo) / (hi - lo) * 255.0, 0, 255).astype(np.uint8)
+            elif a.dtype != np.uint8:
+                a = np.clip(a, 0, 255).astype(np.uint8)
+
+            h, w, _ = a.shape
+            qimg = QImage(a.data, w, h, 3 * w, QImage.Format.Format_RGB888)
             return QPixmap.fromImage(qimg.copy())
+
+        # Grayscale
+        if a.ndim == 2:
+            # True 16-bit support if you ever keep uint16 frames
+            if a.dtype == np.uint16:
+                h, w = a.shape
+                qimg = QImage(a.data, w, h, 2 * w, QImage.Format.Format_Grayscale16)
+                return QPixmap.fromImage(qimg.copy())
+
+            # float -> display uint8 (percentile)
+            if np.issubdtype(a.dtype, np.floating):
+                lo = np.percentile(a, 1.0)
+                hi = np.percentile(a, 99.0)
+                if hi <= lo:
+                    hi = lo + 1.0
+                a = np.clip((a - lo) / (hi - lo) * 255.0, 0, 255).astype(np.uint8)
+            elif a.dtype != np.uint8:
+                a = np.clip(a, 0, 255).astype(np.uint8)
+
+            h, w = a.shape
+            qimg = QImage(a.data, w, h, w, QImage.Format.Format_Grayscale8)
+            return QPixmap.fromImage(qimg.copy())
+
+        # Fallback: make grayscale
+        gray = a.mean(axis=-1)
+        return self._array_to_qpixmap(gray)
+
+    def on_preset_changed(self, *_):
+        # Update which param widgets are shown/hidden
+        self._update_preset_controls()
+
+        # Optional: auto-apply once data exists
+        if self.video_data is not None:
+            self.apply_point_preset()
+
+    def _set_visible(self, widgets, visible: bool):
+        for w in widgets:
+            w.setVisible(visible)
+
+    def _update_preset_controls(self):
+        preset = self.preset_combo.currentText()
+
+        is_grid = preset.startswith("Regular grid")
+        is_features = preset.startswith("Features")
+        is_activity = preset.startswith("Activity")
+        is_seg = preset.startswith("Segmentation")
+
+        show_rows_cols = is_grid
+        show_n = is_features or is_activity or is_seg
+        show_mindist = is_features or is_activity
+
+        # Rows/Cols
+        self._set_visible([self.lbl_rows, self.grid_rows_ctrl, self.lbl_cols, self.grid_cols_ctrl], show_rows_cols)
+
+        # N
+        self._set_visible([self.lbl_N, self.num_points_spin], show_n)
+
+        # MinDist
+        self._set_visible([self.lbl_minDist, self.min_dist_spin], show_mindist)
+
+        self.apply_preset_btn.setVisible(True)
+        self.apply_preset_btn.setEnabled(True)
 
     def _draw_points_on_pixmap(self, pixmap, points, color=(255, 0, 0), radius=3):
         """Return a new QPixmap with the points drawn on top."""
@@ -707,9 +1017,10 @@ class MotionCorrectionGUI(QMainWindow):
                 self.load_data()
 
     def show_input_frame_only(self):
-        frame = self.video_data.permute(0, 2, 3, 1).cpu().numpy().astype(np.uint8)[0]
+        arr = self.video_data.detach().cpu().permute(0, 2, 3, 1).numpy().astype(np.float32)
+        frame = arr[0]
         if 'input' not in self.viz_data:
-            self.viz_data['input'] = self.video_data.permute(0, 2, 3, 1).cpu().numpy().astype(np.uint8)
+            self.viz_data['input'] = arr
         # Update input label
         self._update_label_with_overlay(self.lbl_input, frame)
         # Clear other panels
@@ -806,16 +1117,16 @@ class MotionCorrectionGUI(QMainWindow):
         good = (pts[:, 0] >= border) & (pts[:, 0] < (W - border)) & (pts[:, 1] >= border) & (pts[:, 1] < (H - border))
         return pts[good]
 
-    def _preset_features(self, ref_u8, num_points=400, min_dist=10):
+    def _preset_features(self, ref_u8_filt, num_points=400, min_dist=10):
         """Shi–Tomasi features on reference image."""
-        H, W = ref_u8.shape[:2]
+        H, W = ref_u8_filt.shape[:2]
 
         # foreground-ish mask (optional but helps a lot)
-        _, m = cv2.threshold(ref_u8, 0, 255, cv2.THRESH_OTSU)
+        _, m = cv2.threshold(ref_u8_filt, 0, 255, cv2.THRESH_OTSU)
         m = cv2.medianBlur(m, 5)
 
         pts = cv2.goodFeaturesToTrack(
-            ref_u8,
+            ref_u8_filt,
             maxCorners=int(num_points),
             qualityLevel=0.01,
             minDistance=float(min_dist),
@@ -828,7 +1139,7 @@ class MotionCorrectionGUI(QMainWindow):
         pts = pts.reshape(-1, 2).astype(np.float32)  # (x,y)
         return self._clip_border(pts, H, W, border=10)
 
-    def _preset_activity(self, gray_video, num_points=400, min_dist=10):
+    def _preset_activity(self, gray_video, num_points=200, min_dist=15):
         """Activity map (mean abs diff) -> features."""
         H, W = gray_video.shape[1], gray_video.shape[2]
         T = gray_video.shape[0]
@@ -858,10 +1169,10 @@ class MotionCorrectionGUI(QMainWindow):
         pts = pts.reshape(-1, 2).astype(np.float32)
         return self._clip_border(pts, H, W, border=10)
 
-    def _preset_segmentation_centroids(self, ref_u8, num_points=400):
+    def _preset_segmentation_centroids(self, ref_u8_filt, num_points=200):
         """Otsu segmentation -> connected components centroids."""
-        H, W = ref_u8.shape[:2]
-        _, bw = cv2.threshold(ref_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        H, W = ref_u8_filt.shape[:2]
+        _, bw = cv2.threshold(ref_u8_filt, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
         # clean up a bit
         bw = cv2.medianBlur(bw, 5)
@@ -893,9 +1204,14 @@ class MotionCorrectionGUI(QMainWindow):
         if self.video_data is None:
             return
 
-        gray = self._get_gray_video_np()      # (T,H,W)
+        gray = self._get_gray_video_np()  # (T,H,W) float32
         H, W = gray.shape[1], gray.shape[2]
-        ref_u8 = self._reference_image(gray)
+
+        # reference image for presets (uint8)
+        ref_u8 = self._reference_image(gray)  # already uint8 in your implementation
+
+        # apply selected filter to the reference (returns uint8 in my apply_filter)
+        ref_u8_filt = self.apply_filter(ref_u8, self.current_filter)
 
         preset = self.preset_combo.currentText()
 
@@ -916,11 +1232,11 @@ class MotionCorrectionGUI(QMainWindow):
             min_dist = int(self.min_dist_spin.value())
 
             if preset.startswith("Features"):
-                pts = self._preset_features(ref_u8, num_points=num_points, min_dist=min_dist)
+                pts = self._preset_features(ref_u8_filt, num_points=num_points, min_dist=min_dist)
             elif preset.startswith("Activity"):
                 pts = self._preset_activity(gray, num_points=num_points, min_dist=min_dist)
             else:
-                pts = self._preset_segmentation_centroids(ref_u8, num_points=num_points)
+                pts = self._preset_segmentation_centroids(ref_u8_filt, num_points=num_points)
 
         self.base_grid_pts = pts.astype(np.float32)
         self.base_grid_active = np.ones((self.base_grid_pts.shape[0],), dtype=bool)
@@ -934,20 +1250,38 @@ class MotionCorrectionGUI(QMainWindow):
         if self.video_data is None:
             return
         self.update_grid_display_pre_registration()
+    
+    def _set_input_image(self, frame):
+        bg = self.apply_filter(frame, self.current_filter)
+        pix = self._array_to_qpixmap(bg)
+        # Force empty overlays (prevents any “leak”)
+        self.lbl_input.setPixmap(pix, overlay_data={})
 
+    def _get_current_tracks(self):
+        """Return (N,2) tracks for the current frame, or None."""
+        if 'tracks' not in self.viz_data or self.viz_data['tracks'] is None:
+            return None
+        tr = self.viz_data['tracks']  # expected (T,N,2)
+        if not hasattr(tr, "shape") or tr.ndim != 3 or tr.shape[0] == 0:
+            return None
+        idx = min(self.current_frame, tr.shape[0] - 1)
+        return tr[idx]
 
     def update_grid_display_pre_registration(self):
         if self.video_data is None:
             return
-        frame0 = self.video_data.permute(0, 2, 3, 1).cpu().numpy().astype(np.uint8)[0]
-        # Base grid: only active points
+
+        frame0 = self.video_data.permute(0, 2, 3, 1).cpu().numpy()[0]  # keep float
+        bg = self.apply_filter(frame0, self.current_filter)
+
         ptsA = None
         if self.base_grid_pts is not None and self.base_grid_active is not None:
             active = self.base_grid_active
             if np.any(active):
                 ptsA = self.base_grid_pts[active]
+
         custom_pts = np.array(self.custom_grid_pts, dtype=np.float32) if len(self.custom_grid_pts) > 0 else None
-        self._update_label_with_overlay(self.lbl_grid, frame0, ptsA=ptsA, custom_pts=custom_pts)
+        self._update_label_with_overlay(self.lbl_grid, bg, ptsA=ptsA, custom_pts=custom_pts)
 
     def clear_all_data(self):
         """Clear all stored processing results and cached data."""
@@ -1338,22 +1672,28 @@ class MotionCorrectionGUI(QMainWindow):
     def update_grid_display(self):
         if self.video_data is None:
             return
-        frame0 = self.video_data.permute(0, 2, 3, 1).cpu().numpy().astype(np.uint8)[0]
+
+        frame0 = self.video_data.permute(0, 2, 3, 1).detach().cpu().numpy()[0]
+        bg = self.apply_filter(frame0, self.current_filter)
+
         title = "Tracked Points (Frame 0) — click to add/remove" if self.edit_mode else "Tracked Points (Frame 0)"
         self.lbl_grid_title.setText(title)
+
         init_xy = None
-        if self.pred_tracks is not None:
-            tracks_np = self._tracks_to_numpy()
-            if tracks_np is not None:
-                init_xy = tracks_np[0, 0]
+        tracks_np = self._tracks_to_numpy()
+        if tracks_np is not None and tracks_np.ndim == 3 and tracks_np.shape[0] > 0:
+            init_xy = tracks_np[0]  # (N,2)
+
         ptsA = None
         if self.base_grid_pts is not None and self.base_grid_active is not None:
             active = self.base_grid_active
             if np.any(active):
                 ptsA = self.base_grid_pts[active]
+
         custom_pts = np.array(self.custom_grid_pts, dtype=np.float32) if len(self.custom_grid_pts) > 0 else None
-        # Show grid with base points, custom points, and initial tracks overlay
-        self._update_label_with_overlay(self.lbl_grid, frame0, ptsA=ptsA, custom_pts=custom_pts, tracks=init_xy)
+
+        self._update_label_with_overlay(self.lbl_grid, bg, ptsA=ptsA, custom_pts=custom_pts, tracks=init_xy)
+
 
     def run_processing(self):
         if self.video_data is None:
@@ -1581,6 +1921,28 @@ class MotionCorrectionGUI(QMainWindow):
                     event.acceptProposedAction()
                     return
     
+
+    def disp_scalar_u8(self, disp_hw, clip=None):
+        """
+        disp_hw: (H,W) scalar displacement (float)
+        Returns: (H,W) uint8 for display. 127 = zero (if symmetric scaling).
+        """
+        d = np.asarray(disp_hw, dtype=np.float32)
+        finite = np.isfinite(d)
+        if not finite.any():
+            return np.zeros(d.shape, dtype=np.uint8)
+
+        if clip is None:
+            # robust symmetric scaling around 0
+            a = np.abs(d[finite])
+            clip = float(np.percentile(a, 99.5))
+            if clip <= 1e-6:
+                clip = 1.0
+
+        d = np.clip(d, -clip, clip)
+        out = ((d + clip) / (2 * clip) * 255.0).astype(np.uint8)
+        return disp_hw
+
     def visualize(self):
         if self.video_data is None:
             return
@@ -1596,11 +1958,8 @@ class MotionCorrectionGUI(QMainWindow):
 
         # Prepare data - cache as numpy arrays for faster access
         if 'input' not in self.viz_data:
-            # Apply filter to each frame before caching
-            filtered = []
-            for frame in self.video_data.permute(0, 2, 3, 1).cpu().numpy():
-                filtered.append(self.apply_filter(frame, self.current_filter))
-            self.viz_data['input'] = np.stack(filtered, axis=0).astype(np.float32)
+            self.viz_data['input'] = self.video_data.permute(0,2,3,1).detach().cpu().numpy().astype(np.float32)
+
         
         if full_viz:
             self.viz_data['warped'] = self.warped_video
@@ -1618,9 +1977,22 @@ class MotionCorrectionGUI(QMainWindow):
             if tracks_np is not None:
                 self.viz_data['tracks'] = tracks_np[0]
         
-        # 1. Input Video - update label
+        current_tracks = None
+        if not self.edit_mode:
+            current_tracks = self._get_current_tracks()
+        # 1) Input panel: filtered image only, NO overlays ever
         input_frame = self.viz_data['input'][self.current_frame]
-        self._update_label_with_overlay(self.lbl_input, input_frame)
+        self._set_input_image(input_frame)
+
+        # 2) Tracked points panel: same filtered background + overlays
+        bg = self.apply_filter(input_frame, self.current_filter)
+        if not self.edit_mode:
+            current_tracks = self._get_current_tracks()
+            self._update_label_with_overlay(self.lbl_grid, bg, tracks=current_tracks, show_trajectories=True)
+        else:
+            self.update_grid_display_pre_registration()
+        
+
         
         if full_viz:
             # 2. Grid Points (Input + Tracks at current frame)
@@ -1643,45 +2015,65 @@ class MotionCorrectionGUI(QMainWindow):
                 self._update_label_with_overlay(self.lbl_warped, warped_frame)
             
             # 4. Deformation Field
+           # 4. Deformation Field
             if 'disp_field' in self.viz_data and self.viz_data['disp_field'] is not None:
-                disp_stack = self.viz_data['disp_field']
-                # disp_stack should be (T, H, W, 2)
-                if disp_stack.ndim == 4:
-                    d_idx = min(self.current_frame, disp_stack.shape[0]-1)
-                    flow_img = self.flow_to_color(disp_stack[d_idx])
-                    self._update_label_with_overlay(self.lbl_tracks, flow_img)
-        else:
-            # No visualization data yet - keep default labels
-            pass
+                disp_stack = self.viz_data['disp_field']  # expected (T,H,W) OR (T,H,W,2)
+
+                if isinstance(disp_stack, torch.Tensor):
+                    disp_stack = disp_stack.detach().cpu().numpy()
+                disp_stack = np.asarray(disp_stack)
+
+                d_idx = min(self.current_frame, disp_stack.shape[0] - 1)
+
+                if disp_stack.ndim == 3:
+                    # (T,H,W) scalar displacement
+                    img = self.disp_scalar_u8(disp_stack[d_idx])
+                    self._update_label_with_overlay(self.lbl_tracks, img)
+
+                elif disp_stack.ndim == 4 and disp_stack.shape[-1] == 2:
+                    # (T,H,W,2) vector displacement -> show dx or dy
+                    img_dx = self.flow_component_u8(disp_stack[d_idx], component=0)
+                    self._update_label_with_overlay(self.lbl_tracks, img_dx)
+            else:
+                # No visualization data yet - keep default labels
+                pass
+
+    
 
     def update_plot(self):
         if 'input' not in self.viz_data:
             return
-        # Update Input label
         input_frame = self.viz_data['input'][self.current_frame]
-        self._update_label_with_overlay(self.lbl_input, input_frame)
+        self._set_input_image(input_frame)   # instead of _update_label_with_overlay on lbl_input
+        bg = self.apply_filter(input_frame, self.current_filter)
 
-        # Update warped or preview
-        # Update warped
-        if 'warped' in self.viz_data:
-            warped = self.viz_data['warped']
-            warp_idx = min(self.current_frame, warped.shape[0]-1)
-            warped_frame = warped[warp_idx]
-            self._update_label_with_overlay(self.lbl_warped, warped_frame)
+        # Panel 1: Input
+        self._update_label_with_overlay(self.lbl_input, bg)
 
-        # Update Moving Grid Points (Panel 2)
+        # Panel 2: Tracked points (USE THE SAME bg)
         if not self.edit_mode and 'tracks' in self.viz_data:
-            current_tracks = self.viz_data['tracks'][min(self.current_frame, self.viz_data['tracks'].shape[0]-1)]
-            # Show on top of current input frame
-            self._update_label_with_overlay(self.lbl_grid, input_frame, tracks=current_tracks, show_trajectories=True)
+            current_tracks = self._get_current_tracks()  # your safe helper
+            self._update_label_with_overlay(self.lbl_grid, bg, tracks=current_tracks, show_trajectories=True)
+        else:
+            self.update_grid_display_pre_registration()
 
-        # Update Displacement Field (Panel 4)
+        # Panel 3: warped
+        if 'warped' in self.viz_data and self.viz_data['warped'] is not None:
+            warped = self.viz_data['warped']
+            warp_idx = min(self.current_frame, warped.shape[0] - 1)
+            warped_frame = warped[warp_idx]
+            warped_bg = self.apply_filter(warped_frame, self.current_filter)
+            self._update_label_with_overlay(self.lbl_warped, warped_bg)
+
+        # Panel 4: flow (leave as-is)
         if 'disp_field' in self.viz_data and self.viz_data['disp_field'] is not None:
             disp_stack = self.viz_data['disp_field']
             if disp_stack.ndim == 4:
-                d_idx = min(self.current_frame, disp_stack.shape[0]-1)
+                d_idx = min(self.current_frame, disp_stack.shape[0] - 1)
                 flow_img = self.flow_to_color(disp_stack[d_idx])
                 self._update_label_with_overlay(self.lbl_tracks, flow_img)
+
+
 
 
 

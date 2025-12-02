@@ -118,23 +118,13 @@ def cotrack_model(video, queries, grid_size=0):
 #     return np.array(warpeds)
 
 
+
 def warping(predicted_tracks, frames):
     """
-    Non-uniform-grid warping via scattered interpolation.
-
-    Args:
-        predicted_tracks: (B, T, N, 2) in (x,y) as torch.Tensor or np.ndarray
-        frames: video as torch.Tensor or np.ndarray
-            supported: (T,C,H,W) or (T,H,W,C) or (T,H,W)
-        fps: if provided, velocity is pixels/second; otherwise pixels/frame
-        return_velocity: whether to compute and return velocity
-
     Returns:
-        warpeds: np.ndarray (T, H, W)   (warps channel 0 if frames are multi-channel)
-        phis:    np.ndarray (T, H, W, 2) displacement field from frame 0 -> frame t
-        vels:    np.ndarray (T, H, W, 2) velocity field (optional)
+        warpeds: (T,H,W) float32
+        phis:    (T,H,W,2) float32  where phis[t,...] = (dx,dy) mapping ref->frame_t
     """
-    # ---- to numpy ----
     if "torch" in str(type(predicted_tracks)):
         predicted_tracks = predicted_tracks.detach().cpu().numpy()
     if "torch" in str(type(frames)):
@@ -144,13 +134,12 @@ def warping(predicted_tracks, frames):
     if tracks.ndim != 4 or tracks.shape[-1] != 2:
         raise ValueError(f"predicted_tracks must be (B,T,N,2), got {tracks.shape}")
 
-    # ---- normalize frames to (T,H,W,C) or (T,H,W) ----
     frames = np.asarray(frames)
-    if frames.ndim == 4 and frames.shape[1] in (1, 3):          # (T,C,H,W)
-        frames = frames.transpose(0, 2, 3, 1)                    # -> (T,H,W,C)
-    elif frames.ndim == 3:                                       # (T,H,W)
+    if frames.ndim == 4 and frames.shape[1] in (1, 3):  # (T,C,H,W)
+        frames = frames.transpose(0, 2, 3, 1)            # (T,H,W,C)
+    elif frames.ndim == 3:                               # (T,H,W)
         pass
-    elif frames.ndim == 4 and frames.shape[-1] in (1, 3):        # (T,H,W,C)
+    elif frames.ndim == 4 and frames.shape[-1] in (1, 3):# (T,H,W,C)
         pass
     else:
         raise ValueError(f"Unsupported frames shape: {frames.shape}")
@@ -163,47 +152,60 @@ def warping(predicted_tracks, frames):
     if T_orig > T:
         raise ValueError(f"frames has {T_orig} frames but predicted_tracks has only {T} timesteps")
 
-    # Reference point positions (frame 0)
-    p_ref = tracks[0, 0].astype(np.float32)  # (N,2)
+    p_ref_all = tracks[0, 0].astype(np.float32)  # (N,2)
 
-    # Pixel grid (reference coordinates)
     grid_x, grid_y = np.meshgrid(np.arange(W, dtype=np.float32),
                                  np.arange(H, dtype=np.float32))
 
-    # Output buffers
-    if frames.ndim == 4:
-        warpeds = [frames[0][..., 0]]
-    else:
-        warpeds = [frames[0]]
+    # store channel-0 if RGB
+    first = frames[0][..., 0] if frames.ndim == 4 else frames[0]
+    warpeds = [first.astype(np.float32)]
+    #phis = [np.zeros((H, W, 2), dtype=np.float32)]
+    phis = []
+    velo = []
 
-    # We'll store displacement fields as (T, H, W, 2), with phi[0]=0
-    phis = [np.zeros((H, W, 2), dtype=np.float32)]
+    sparse_x = tracks[0, :, :, 0]  
+    sparse_y = tracks[0, :, :, 1]  
+    displacement = tracks[0] - tracks[0, 0]  # (T, G, 2)
+    X, Y = np.meshgrid(W,H)
+    dx_dense = np.zeros((T, H, W))
+    dy_dense = np.zeros((T, H, W))
+    for t in range(T):
+        dx_dense[t] = griddata(
+            (sparse_x[t], sparse_y[t]), displacement[t, :, 0], (X, Y), method='nearest', fill_value=0
+        )    
+        dy_dense[t] = griddata(
+            (sparse_x[t], sparse_y[t]), displacement[t, :, 1], (X, Y), method='nearest', fill_value=0
+        )
+    # Stack dx and dy to calculate v
+    vp = np.stack((dx_dense, dy_dense), axis=1)
+    print(vp.shape)
 
     for i in range(1, T_orig):
-        p_src = tracks[0, i].astype(np.float32)  # (N,2)
+        p_src_all = tracks[0, i].astype(np.float32)
 
-        # # drop invalid points
-        # good = np.isfinite(p_ref_all).all(axis=1) & np.isfinite(p_src_all).all(axis=1)
-        # p_ref = p_ref_all[good]
-        # p_src = p_src_all[good]
+        good = np.isfinite(p_ref_all).all(axis=1) & np.isfinite(p_src_all).all(axis=1)
+        p_ref = p_ref_all[good]
+        p_src = p_src_all[good]
 
         if p_ref.shape[0] < 3:
-            # too few points => identity warp fallback and zero/previous phi
-            warpeds.append(frames[i][..., 0] if frames.ndim == 4 else frames[i])
-            phis.append(phis[-1].copy())
+            src = frames[i][..., 0] if frames.ndim == 4 else frames[i]
+            warpeds.append(src.astype(np.float32))
+            #phis.append(phis[-1].copy())
             continue
 
-        # Displacement at reference points: d(p_ref) = p_src - p_ref
-        disp = (p_src - p_ref).astype(np.float32)  # (M,2)
+        disp = (p_src - p_ref).astype(np.float32)  # dx,dy at ref points
 
-        # Interpolate dx/dy over full image grid
-        dx = griddata(p_ref, disp[:, 0], (grid_x, grid_y), method="linear", fill_value=np.nan)
-        dy = griddata(p_ref, disp[:, 1], (grid_x, grid_y), method="linear", fill_value=np.nan)
+        dx = griddata(p_ref, disp[:, 0], (grid_x, grid_y), method="linear",  fill_value=0)#fill_value=np.nan)
+        dy = griddata(p_ref, disp[:, 1], (grid_x, grid_y), method="linear",  fill_value=0)#fill_value=np.nan)
         
-        # dx = gaussian_filter(dx, sigma=2.0, mode="nearest")
-        # dy = gaussian_filter(dy, sigma=2.0, mode="nearest")
+        phi = np.diff(vp,axis=0)[0:i].sum(0)      
+        phis.append(phi)
 
-        # Fill outside convex hull using nearest interpolation
+        u = vp[i, 0]  # dx
+        v = vp[i, 0]  # dy
+        velo.append(np.sqrt(u**2 + v**2))
+
         nan = np.isnan(dx) | np.isnan(dy)
         if np.any(nan):
             dx_nn = griddata(p_ref, disp[:, 0], (grid_x, grid_y), method="nearest")
@@ -211,11 +213,6 @@ def warping(predicted_tracks, frames):
             dx[nan] = dx_nn[nan]
             dy[nan] = dy_nn[nan]
 
-        # Store the SAME displacement field that you actually warp with
-        phi = np.stack([dx, dy], axis=-1).astype(np.float32)  # (H,W,2)
-        phis.append(phi)
-
-        # Warp frame i (channel 0 if multi-channel)
         sample_x = grid_x + dx
         sample_y = grid_y + dy
 
@@ -226,12 +223,11 @@ def warping(predicted_tracks, frames):
             order=3,
             mode="nearest",
         )
-        warpeds.append(warped)
+        warpeds.append(warped.astype(np.float32))
+    print(np.array(velo).shape)
 
-    warpeds = np.asarray(warpeds)  # (T_orig,H,W)
-    phis = np.asarray(phis)        # (T_orig,H,W,2)
+    return np.asarray(warpeds, dtype=np.float32), np.array(velo)
 
-    return warpeds, phis
 
 
 
