@@ -152,6 +152,20 @@ def warping(predicted_tracks, frames, smoothing=3,
     else:
         raise ValueError(f"Unsupported frames shape: {frames.shape}")
 
+    # ---- input range (gray channel 0) ----
+    if frames.ndim == 4 and frames.shape[1] in (1, 3):          # (T,C,H,W)
+        gray_stack = frames[:, 0].astype(np.float32, copy=False)
+    else:                                                       # (T,H,W,C)
+        gray_stack = frames[..., 0].astype(np.float32, copy=False)
+
+    in_min = float(np.nanmin(gray_stack))
+    in_max = float(np.nanmax(gray_stack))
+    do_clip = np.isfinite(in_min) and np.isfinite(in_max) and (in_max >= in_min)
+
+    # clip the reference frame too (optional but keeps everything consistent)
+    if do_clip:
+        frame0_gray = np.clip(frame0_gray, in_min, in_max).astype(np.float32, copy=False)
+
     B, T, G, D = tracks.shape
     if D != 2:
         raise ValueError(f"predicted_tracks last dim must be 2, got {D}")
@@ -234,12 +248,21 @@ def warping(predicted_tracks, frames, smoothing=3,
         sample_x = grid_x0 + phi[0]
         sample_y = grid_y0 + phi[1]
 
+        src = get_frame_gray(i).astype(np.float32, copy=False)
+
+        # mild anti-aliasing blur (tune sigma: 0.5 to 1.5 typically)
+        src = cv2.GaussianBlur(src, (0, 0), 0.8)
+
         warped = map_coordinates(
-            get_frame_gray(i),
+            src,
             [sample_y, sample_x],
-            order=1,
-            mode="nearest"
+            order=3,
+            mode="reflect"   
         ).astype(np.float32)
+
+        if do_clip:
+            warped = np.clip(warped, in_min, in_max, out=warped)
+
         warpeds.append(warped)
 
     return np.asarray(warpeds, dtype=np.float32), np.asarray(phis, dtype=np.float32)
