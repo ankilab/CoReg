@@ -120,11 +120,12 @@ def cotrack_model(video, queries, grid_size=0):
 
 
 
-def warping(predicted_tracks, frames,
-            random=True, predicted=False):
+def warping(predicted_tracks, frames, smoothing=3,
+            random=True, predicted=False, callback=None):
     """
     predicted_tracks: (B, T, G, 2)
     frames: torch or np, shape (T, C, H, W) or (T, H, W, C)
+    callback: function(float), optional callback for progress (0..1)
 
     Returns:
         warpeds: (T, H, W) float32 (channel-0)
@@ -159,6 +160,18 @@ def warping(predicted_tracks, frames,
     if T_orig > T:
         raise ValueError(f"frames has {T_orig} frames but predicted_tracks has only {T} timesteps")
 
+    sigma = float(smoothing) if smoothing is not None else 0.0
+    do_smooth = sigma > 0.0
+
+    def smooth_phi(phi_2hw: np.ndarray) -> np.ndarray:
+        """phi_2hw: (2,H,W) -> smoothed (2,H,W)"""
+        if not do_smooth:
+            return phi_2hw.astype(np.float32, copy=False)
+        out = np.empty_like(phi_2hw, dtype=np.float32)
+        out[0] = cv2.GaussianBlur(phi_2hw[0].astype(np.float32), (0, 0), sigma)
+        out[1] = cv2.GaussianBlur(phi_2hw[1].astype(np.float32), (0, 0), sigma)
+        return out
+
     # ---- build dense displacement field vp: (T,2,H,W), displacement from t=0 ----
     if random:
         sparse_x = tracks[0, :, :, 0]  # (T, G)
@@ -174,7 +187,7 @@ def warping(predicted_tracks, frames,
                 (sparse_x[t], sparse_y[t]),
                 disp_sparse[t, :, 0],
                 (X, Y),
-                method="nearest",
+                method="linear",
                 fill_value=0
             ).astype(np.float32)
 
@@ -182,7 +195,7 @@ def warping(predicted_tracks, frames,
                 (sparse_x[t], sparse_y[t]),
                 disp_sparse[t, :, 1],
                 (X, Y),
-                method="nearest",
+                method="linear",
                 fill_value=0
             ).astype(np.float32)
 
@@ -209,9 +222,14 @@ def warping(predicted_tracks, frames,
     phis.append(np.zeros((H, W, 2), dtype=np.float32))
 
     for i in range(1, T_orig):
+        
+        if callback is not None:
+             callback(i / T_orig)
 
-        phi = vp[i]  # (2,H,W) displacement from t=0
-        phis.append(np.stack([phi[0], phi[1]], axis=-1))  # (H,W,2)
+        phi = vp[i]            # (2,H,W) raw displacement from t=0
+        phi = smooth_phi(phi)  # <-- KEY CHANGE: smooth DF inside warping()
+
+        phis.append(np.stack([phi[0], phi[1]], axis=-1))  # (H,W,2) (smoothed)
 
         sample_x = grid_x0 + phi[0]
         sample_y = grid_y0 + phi[1]
@@ -219,7 +237,7 @@ def warping(predicted_tracks, frames,
         warped = map_coordinates(
             get_frame_gray(i),
             [sample_y, sample_x],
-            order=3,
+            order=1,
             mode="nearest"
         ).astype(np.float32)
         warpeds.append(warped)

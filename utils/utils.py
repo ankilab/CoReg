@@ -8,7 +8,11 @@ import h5py
 from pathlib import Path
 import hdf5plugin
 
-
+def to_uint8_contrast(video16, p_low=1, p_high=99.8):
+    v = video16.astype(np.float32)
+    lo, hi = np.percentile(v, (p_low, p_high))
+    v = np.clip((v - lo) / (hi - lo + 1e-6), 0, 1)
+    return (v * 255).astype(np.uint8)
 
 def load_hdf5(h5_path, dataset_path, frames: int = 200, resize=True):
     if not Path(h5_path).exists():
@@ -45,14 +49,17 @@ def load_tiff(path, frames: int = 50):
 
     if mm.ndim == 3:
         T = min(int(frames), mm.shape[0])
-        # Convert each frame to native-endian uint16 (contiguous)
-        video = np.stack([np.array(mm[i], dtype=np.uint16) for i in range(T)], axis=0)
+        video = np.ascontiguousarray(mm[:T])  # keep dtype (often uint16)
     elif mm.ndim == 2:
-        video = np.array(mm, dtype=np.uint16)[None, ...]  # make it (1,H,W)
+        video = np.ascontiguousarray(mm[None, ...])
     else:
         raise ValueError(f"Unsupported TIFF ndim={mm.ndim} with shape={mm.shape}")
 
-    return video
+    # If endian is non-native, fix it
+    if not video.dtype.isnative:
+        video = video.byteswap().newbyteorder()
+
+    return to_uint8_contrast(video)
 
 def load_video(file: str, resize: bool = True, size=(256, 256), max_frames: int = 20):
     """

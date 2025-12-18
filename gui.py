@@ -24,14 +24,16 @@ pg.setConfigOptions(imageAxisOrder='row-major')  # damit (H,W) wie numpy angezei
 class ProcessingWorker(QThread):
     tracks_ready = pyqtSignal(object, object, object)  # tracks_np, visibility, grid
     progress = pyqtSignal(int)  # percent complete
+    status_update = pyqtSignal(str)
     finished = pyqtSignal(object, object, object, object, object)  # tracks_np, visibility, grid, warped_full, disp_field
     error = pyqtSignal(str)
 
-    def __init__(self, video_data, base_grid_pts, custom_grid_pts=None, parent=None):
+    def __init__(self, video_data, base_grid_pts, custom_grid_pts=None, df_sigma=3.0,parent=None):
         super().__init__(parent)
         self.video_data = video_data
-        self.base_grid_pts = base_grid_pts              # (1, K, 2) torch
-        self.custom_grid_pts = custom_grid_pts          # (M, 2) torch or None
+        self.base_grid_pts = base_grid_pts
+        self.custom_grid_pts = custom_grid_pts
+        self.df_sigma = float(df_sigma)
         self._is_running = True
 
     def stop(self):
@@ -39,7 +41,10 @@ class ProcessingWorker(QThread):
 
     def run(self):
         try:
-            grid_xy = self.base_grid_pts
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            video = self.video_data.to(device) if isinstance(self.video_data, torch.Tensor) else self.video_data
+
+            grid_xy = self.base_grid_pts.to(device)
             if self.custom_grid_pts is not None:
                 custom_xy = self.custom_grid_pts
                 if isinstance(custom_xy, np.ndarray):
@@ -52,7 +57,10 @@ class ProcessingWorker(QThread):
             t = torch.zeros((*grid_xy.shape[:-1], 1), device=grid_xy.device, dtype=grid_xy.dtype)
             queries = torch.cat([t, grid_xy], dim=-1)
 
-            pred_tracks, pred_visibility = cotrack_model(self.video_data, queries=queries)
+            self.status_update.emit("Tracking running...")
+            self.progress.emit(0)
+
+            pred_tracks, pred_visibility = cotrack_model(video, queries=queries)
 
             tracks_raw = pred_tracks.detach().cpu().numpy()   # could be (B,T,N,2) or (T,N,2)
 
@@ -70,9 +78,14 @@ class ProcessingWorker(QThread):
             vis_gui = vis_raw[0] if vis_raw.ndim == 3 else vis_raw      # (T,N) expected for GUI
            
             self.tracks_ready.emit(tracks_gui, vis_gui, grid_xy)
-            self.progress.emit(25)
+            
+            self.progress.emit(70)
+            self.status_update.emit("Warping / Displacement optimization ...")
 
-            warped_video, disp_field = warping(tracks_for_warp, self.video_data)
+            def warp_cb(frac):
+                self.progress.emit(int(70 + frac * 30))
+
+            warped_video, disp_field = warping(tracks_for_warp, video, smoothing=self.df_sigma, callback=warp_cb)
             warped_np = np.asarray(warped_video)
 
             # If warping returns batched outputs, squeeze them for GUI:
@@ -87,6 +100,7 @@ class ProcessingWorker(QThread):
                 pass
 
             self.progress.emit(100)
+            self.status_update.emit("Done")
             self.finished.emit(tracks_gui, vis_gui, grid_xy, warped_np, disp_field)
         except Exception as e:
             import traceback
@@ -433,9 +447,11 @@ class PGImagePanel(pg.PlotWidget):
             self.addItem(it)
         
 
-        self.scene().sigMouseMoved.connect(self._on_mouse_moved)
-        self.scene().sigMouseClicked.connect(self._on_mouse_clicked)
-
+        self.scene().sigMouseMoved.disconnect(self._on_mouse_moved) if hasattr(self, '_on_mouse_moved') else None
+        self.scene().sigMouseClicked.disconnect(self._on_mouse_clicked) if hasattr(self, '_on_mouse_clicked') else None
+        
+        self.last_mouse_pos = None
+        self._possible_click = False
 
     def _trail_color(self, u):
         # u in [0..1]
@@ -458,24 +474,51 @@ class PGImagePanel(pg.PlotWidget):
             return
 
         a = np.asarray(img_np)
+
+        # ---- make display-safe for pyqtgraph ----
+        if a.dtype.kind == "f":
+            # grayscale float -> provide explicit levels
+            if a.ndim == 2:
+                finite = np.isfinite(a)
+                if finite.any():
+                    lo = float(np.nanpercentile(a[finite], 1))
+                    hi = float(np.nanpercentile(a[finite], 99))
+                    if hi <= lo:
+                        hi = lo + 1.0
+                else:
+                    lo, hi = 0.0, 1.0
+
+                self.img_item.setImage(a, levels=(lo, hi), autoLevels=False)
+            else:
+                # RGB/RGBA float -> convert to uint8 (no levels needed)
+                finite = np.isfinite(a)
+                if finite.any():
+                    lo = float(np.nanpercentile(a[finite], 1))
+                    hi = float(np.nanpercentile(a[finite], 99))
+                    if hi <= lo:
+                        hi = lo + 1.0
+                    a = np.clip((a - lo) / (hi - lo) * 255.0, 0, 255).astype(np.uint8)
+                else:
+                    a = np.zeros_like(a, dtype=np.uint8)
+                self.img_item.setImage(a, autoLevels=False)
+
+        else:
+            # integer/bool types are fine; keep autoLevels for uint16 etc if you want
+            if a.dtype == np.bool_:
+                a = (a.astype(np.uint8) * 255)
+            self.img_item.setImage(a, autoLevels=True)
+
+        # ---- rest of your original sizing / autorange ----
         H, W = a.shape[:2]
-        
-        self.img_item.setImage(a, autoLevels=True)
-        
+        size_changed = (self._img_w != W or self._img_h != H)
         self._img_w = W
         self._img_h = H
 
-        self.img_item.setRect(0, 0, W, H)
+        if size_changed:
+            self.img_item.setRect(0, 0, W, H)
+            self.vb.setLimits(xMin=None, xMax=None, yMin=None, yMax=None)
+            self.setMinimumSize(200, 200)
 
-        # Remove tight limits - let the ViewBox be flexible
-        self.vb.setLimits(xMin=None, xMax=None, yMin=None, yMax=None)
-
-        # Set a minimum size hint based on image dimensions
-        # This helps the layout system size the panel appropriately
-        self.setMinimumSize(200, 200)  # Reasonable minimum
-        
-        # Auto-fit the entire image to the view (only on first load or when requested)
-        # Skip during playback to preserve zoom level
         if auto_range:
             QTimer.singleShot(50, lambda: self.vb.autoRange())
 
@@ -510,32 +553,38 @@ class PGImagePanel(pg.PlotWidget):
         T, N, _ = tr.shape
         cf = int(np.clip(current_frame, 0, T - 1))
 
+        # At frame 0, don't draw any trajectories (no previous frame exists)
+        if cf == 0:
+            for it in self.traj_items:
+                it.setData([], [])
+            return
+
+        # From frame 1 onwards, draw trajectories
         L = int(min(max(1, trail), self.max_trail))
-        start_t = max(1, cf - L)
+        start_t = max(1, cf - L + 1)  # Start from frame 1 at minimum
         end_t = cf
 
-        # movement threshold like your old code
+        # movement threshold
         eps_px = 0.5
         eps2 = eps_px * eps_px
 
-        den = max(1, end_t - start_t)
+        den = max(1, end_t - start_t + 1)
 
-        # For each age-step k, draw all segments at that time index with one color
-        # k=0 is oldest, k=L-1 is newest
-        for k in range(self.max_trail):
-            if k >= L:
-                self.traj_items[k].setData([], [])
-                continue
-
-            t = start_t + k  # segment draws (t-1)->t for all points
-            u = (t - start_t) / den  # 0..1
+        # For each segment in the trail
+        # We draw segments from (t-1) -> t for t in [start_t, end_t]
+        segment_idx = 0
+        for t in range(start_t, end_t + 1):
+            if segment_idx >= self.max_trail:
+                break
+                
+            u = (t - start_t) / den  # 0..1 color gradient
             r, g, b = self._trail_color(u)
             pen = pg.mkPen(r, g, b, 255, width=2)
 
             xs, ys = [], []
             for i in range(N):
-                p1 = tr[t - 1, i]
-                p2 = tr[t, i]
+                p1 = tr[t - 1, i]  # previous frame
+                p2 = tr[t, i]      # current frame
                 if not (np.isfinite(p1).all() and np.isfinite(p2).all()):
                     continue
                 dx = float(p2[0] - p1[0])
@@ -546,7 +595,13 @@ class PGImagePanel(pg.PlotWidget):
                 xs.extend([float(p1[0]), float(p2[0]), np.nan])
                 ys.extend([float(p1[1]), float(p2[1]), np.nan])
 
-            self.traj_items[k].setData(xs, ys, pen=pen)
+            self.traj_items[segment_idx].setData(xs, ys, pen=pen)
+            segment_idx += 1
+
+        # Clear remaining trajectory items
+        for k in range(segment_idx, self.max_trail):
+            self.traj_items[k].setData([], [])
+
 
     def _map_scene_to_image(self, scene_pos):
         if scene_pos is None:
@@ -563,19 +618,98 @@ class PGImagePanel(pg.PlotWidget):
             return 3
         return 0
 
-    def _on_mouse_clicked(self, ev):
-        pos = self._map_scene_to_image(ev.scenePos())
-        if pos is None:
-            return
-        x, y = pos
-        self.pressed.emit(x, y, self._qt_btn_to_int(ev.button()))
-        self.released.emit()
-
-    def _on_mouse_moved(self, pos):
-        xy = self._map_scene_to_image(pos)
+    def _is_over_point(self, scene_pos):
+        # We need to map scene pos to view pos (image coords), then check distance to points
+        xy = self._map_scene_to_image(scene_pos)
         if xy is None:
-            return
-        self.moved.emit(xy[0], xy[1])
+            return False
+        
+        x, y = xy
+        # Check scatter points
+        pts_x, pts_y = self.points_item.getData() # arrays
+        if len(pts_x) > 0:
+            # We want visual distance in screen pixels approx.
+            # But here we measure in image pixels.
+            # 15 pixels screen distance approx? 
+            # We can use mapFromViewToScene to check screen pixel dist but that's expensive for all points.
+            # Instead, assume reasonable buffer in image space depending on zoom?
+            # Actually, user interaction feels best if fixed screen tolerance.
+            
+            # Map all points to scene? No.
+            # Let's use simple image space distance. If zoomed in, tolerance in pixels is smaller physically.
+            # Wait, if I zoom in, 10 px on screen matches 0.1 px on image.
+            # So I should use mapSceneToView to get the size of 1 screen pixel.
+            p0 = self.vb.mapSceneToView(pg.Point(0,0))
+            p1 = self.vb.mapSceneToView(pg.Point(10,0)) # 10 screen pixels
+            tol = abs(p1.x() - p0.x()) # Tolerance in image units
+            
+            d2 = (pts_x - x)**2 + (pts_y - y)**2
+            if np.min(d2) < (tol*tol):
+                return True
+
+        # Check crosses
+        c_x, c_y = self.cross_item.getData()
+        if len(c_x) > 0:
+             p0 = self.vb.mapSceneToView(pg.Point(0,0))
+             p1 = self.vb.mapSceneToView(pg.Point(10,0))
+             tol = abs(p1.x() - p0.x())
+             
+             d2 = (c_x - x)**2 + (c_y - y)**2
+             if np.min(d2) < (tol*tol):
+                 return True
+                 
+        return False
+
+    def mousePressEvent(self, ev):
+        if ev.button() == Qt.MouseButton.LeftButton:
+            # Check if over a point - if so, capture event for Editing (Dragging)
+            if self._is_over_point(ev.position()):
+                pos = self._map_scene_to_image(ev.position())
+                if pos:
+                    x, y = pos
+                    self.pressed.emit(x, y, 1)
+                    ev.accept()
+                    return # Don't pass to super (no Pan)
+            else:
+                # Not over point: prepare for possible Add Point (on release) or Pan (on drag)
+                self._possible_click = True
+                self.last_mouse_pos = ev.position()
+        
+        elif ev.button() == Qt.MouseButton.RightButton:
+             # Right click logic (delete etc)
+             # Emit pressed immediately
+             pos = self._map_scene_to_image(ev.position())
+             if pos:
+                x, y = pos
+                self.pressed.emit(x, y, 3)
+                ev.accept()
+                return
+
+        super().mousePressEvent(ev) # Standard Pan/Zoom
+
+    def mouseMoveEvent(self, ev):
+        # Update movement tracking for click detection
+        if self._possible_click:
+            dist = (ev.position() - self.last_mouse_pos).manhattanLength()
+            if dist > 5: # Threshold for drag
+                self._possible_click = False
+
+        pos = self._map_scene_to_image(ev.position())
+        if pos:
+            self.moved.emit(pos[0], pos[1])
+            
+        super().mouseMoveEvent(ev)
+
+    def mouseReleaseEvent(self, ev):
+        if ev.button() == Qt.MouseButton.LeftButton:
+            if self._possible_click: # Was a clean click (no drag) on empty space
+                pos = self._map_scene_to_image(ev.position())
+                if pos:
+                     self.pressed.emit(pos[0], pos[1], 1)
+                self._possible_click = False
+        
+        self.released.emit()
+        super().mouseReleaseEvent(ev)
 
     def reset_view(self):
         if getattr(self, "native_1to1", False):
@@ -755,28 +889,36 @@ class MotionCorrectionGUI(QMainWindow):
         self.lbl_input.set_points(None, None)
         self.lbl_input.set_trajectories(None, 0)
 
-    def _update_label_with_overlay(self, label, arr, ptsA=None, custom_pts=None, tracks=None, show_trajectories=False):
-        pix = self._array_to_qpixmap(arr)
-        overlay_data = {}
+    # def _update_label_with_overlay(self, label, arr, ptsA=None, custom_pts=None, tracks=None, show_trajectories=False):
+    #     pix = self._array_to_qpixmap(arr)
+    #     overlay_data = {}
 
-        points_list = []
-        if ptsA is not None:
-            points_list.append((ptsA, (255, 255, 0), 4))
-        if tracks is not None:
-            points_list.append((tracks, (255, 255, 0), 2))
-        if points_list:
-            overlay_data['points'] = points_list
+    #     points_list = []
+    #     if ptsA is not None:
+    #         points_list.append((ptsA, (255, 255, 0), 4))
+    #     if tracks is not None:
+    #         points_list.append((tracks, (255, 255, 0), 2))
+    #     if points_list:
+    #         overlay_data['points'] = points_list
 
-        if custom_pts is not None and len(custom_pts) > 0:
-            overlay_data['crosses'] = [(custom_pts, (255, 255, 0), 6)]
+    #     if custom_pts is not None and len(custom_pts) > 0:
+    #         overlay_data['crosses'] = [(custom_pts, (255, 255, 0), 6)]
 
-        if show_trajectories and 'tracks' in self.viz_data and self.viz_data['tracks'] is not None:
-            full_tracks = self.viz_data['tracks']  # (T,N,2)
-            overlay_data['trajectories'] = (full_tracks, self.current_frame, 15, (0, 255, 255))
+    #     if show_trajectories and 'tracks' in self.viz_data and self.viz_data['tracks'] is not None:
+    #         full_tracks = self.viz_data['tracks']  # (T,N,2)
+    #         overlay_data['trajectories'] = (full_tracks, self.current_frame, 15, (0, 255, 255))
 
-        #label.setPixmap(pix, overlay_data)
-        panel.set_image(pix, overlay_data)
-        panel.set_points(pix, overlay_data)
+    #     #label.setPixmap(pix, overlay_data)
+    #     panel.set_image(pix, overlay_data)
+    #     panel.set_points(pix, overlay_data)
+
+    def _update_panel(self, panel: PGImagePanel, img, pts=None, crosses=None, tracks=None, show_traj=False):
+        panel.set_image(img, auto_range=False)
+        panel.set_points(pts_xy=pts, crosses_xy=crosses)
+        if show_traj and tracks is not None:
+            panel.set_trajectories(tracks, self.current_frame, trail=15)
+        else:
+            panel.set_trajectories(None, 0)
 
     # ---------- UI ----------
     def init_ui(self):
@@ -853,6 +995,11 @@ class MotionCorrectionGUI(QMainWindow):
         self.sync_view_chk = QCheckBox("Sync view")
         self.sync_view_chk.stateChanged.connect(self.on_sync_view_toggled)
 
+        self.df_sigma_spin = QSpinBox()
+        self.df_sigma_spin.setRange(0, 20)
+        self.df_sigma_spin.setValue(3)
+        self.df_sigma_spin.valueChanged.connect(lambda *_: self.update_plot())
+
         self.points_label = QLabel("Points: 0")
         self.status_label = QLabel("Ready - Drag & drop video or use Load button")
         self.status_label.setWordWrap(True)
@@ -862,21 +1009,11 @@ class MotionCorrectionGUI(QMainWindow):
         self.lbl_rows = QLabel("Rows:")
         self.lbl_cols = QLabel("Cols:")
 
-        self.df_gauss_chk = QCheckBox("DF Gaussian")
-        self.df_gauss_chk.setChecked(True)
-        self.df_gauss_chk.stateChanged.connect(lambda *_: self.update_plot())
-
-        self.df_sigma_spin = QSpinBox()
-        self.df_sigma_spin.setRange(0, 40)
-        self.df_sigma_spin.setValue(20)
-        self.df_sigma_spin.valueChanged.connect(lambda *_: self.update_plot())
-
         # Row 0: Load File, Sync View, DF Gaussian, Filter
         c = 0
         controls_grid.addWidget(self.load_btn, 0, c); c += 1
         controls_grid.addWidget(self.sync_view_chk, 0, c); c += 1
-        controls_grid.addWidget(self.df_gauss_chk, 0, c); c += 1
-        controls_grid.addWidget(QLabel("σ:"), 0, c); c += 1
+        controls_grid.addWidget(QLabel("DF σ:"), 0, c); c += 1
         controls_grid.addWidget(self.df_sigma_spin, 0, c); c += 1
         controls_grid.addWidget(self.lbl_filter, 0, c); c += 1
         controls_grid.addWidget(self.filter_combo, 0, c); c += 1
@@ -890,6 +1027,7 @@ class MotionCorrectionGUI(QMainWindow):
         controls_grid.addWidget(self.apply_preset_btn, 1, c); c += 1
         controls_grid.addWidget(self.process_btn, 1, c); c += 1
         controls_grid.addWidget(self.stop_btn, 1, c); c += 1
+  
         
         # Fixed positions for parameter controls
         # These controls occupy the same grid positions but are toggled with visibility
@@ -1007,6 +1145,7 @@ class MotionCorrectionGUI(QMainWindow):
         self._update_preset_controls()
         self.status_label.setText("UI loaded. Click 'Load File' or drag & drop a file.")
 
+
     def on_sync_view_toggled(self, state):
         panels = [self.lbl_input, self.lbl_grid, self.lbl_warped, self.lbl_tracks]
         master_vb = panels[0].getViewBox()
@@ -1029,12 +1168,12 @@ class MotionCorrectionGUI(QMainWindow):
             w.setVisible(visible)
 
     def _make_disp_preview(self, disp_frame):
+        """Generate the display preview with adjustable Gaussian smoothing for the DF."""
         d = np.asarray(disp_frame)
 
-        do_blur = hasattr(self, "df_gauss_chk") and self.df_gauss_chk.isChecked()
-        sigma = float(self.df_sigma_spin.value()) if hasattr(self, "df_sigma_spin") else 0.0
-
-        if do_blur and sigma > 0:
+        # Read sigma value from the GUI spinner to control smoothing
+        sigma = float(self.df_sigma_spin.value())
+        if sigma > 0:
             if d.ndim == 2:
                 d = cv2.GaussianBlur(d.astype(np.float32), (0, 0), sigma)
             elif d.ndim == 3 and d.shape[-1] == 2:
@@ -1296,10 +1435,10 @@ class MotionCorrectionGUI(QMainWindow):
             self.clear_points_btn.setEnabled(True)
 
             self.play_btn.setEnabled(True)
-            self.step_back_btn.setEnabled(True)
             self.step_fwd_btn.setEnabled(True)
 
             self.update_plot()
+            QTimer.singleShot(100, lambda: self.reset_all_zoom())
 
         except Exception as e:
             self.status_label.setText(f"Error loading data: {e}")
@@ -1417,6 +1556,8 @@ class MotionCorrectionGUI(QMainWindow):
 
     def clear_points(self):
         self.custom_grid_pts = []
+        if self.base_grid_active is not None:
+            self.base_grid_active[:] = False
         self._update_points_label()
         self.update_grid_display_pre_registration()
 
@@ -1457,7 +1598,7 @@ class MotionCorrectionGUI(QMainWindow):
 
         custom_pts = np.array(self.custom_grid_pts, dtype=np.float32) if self.custom_grid_pts else None
 
-        self.lbl_grid.set_image(bg)
+        self.lbl_grid.set_image(bg, auto_range=False)
         self.lbl_grid.set_points(pts_xy=ptsA, crosses_xy=custom_pts)
         self.lbl_grid.set_trajectories(None, 0)
 
@@ -1480,9 +1621,19 @@ class MotionCorrectionGUI(QMainWindow):
         
         # Display tracked points panel
         ptsA = None
-        if self.base_grid_pts is not None and self.base_grid_active is not None and np.any(self.base_grid_active):
-            ptsA = self.base_grid_pts[self.base_grid_active]
-        custom_pts = np.array(self.custom_grid_pts, dtype=np.float32) if self.custom_grid_pts else None
+        custom_pts = None
+        
+        if 'tracks' in self.viz_data and self.viz_data['tracks'] is not None:
+            # Get current frame's tracked positions
+            tracks = self.viz_data['tracks']  # (T, N, 2)
+            if tracks.ndim == 3 and idx < tracks.shape[0]:
+                current_positions = tracks[idx]  # (N, 2) - all points at current frame
+                ptsA = current_positions
+        else:
+            # No tracks yet, show initial grid positions
+            if self.base_grid_pts is not None and self.base_grid_active is not None and np.any(self.base_grid_active):
+                ptsA = self.base_grid_pts[self.base_grid_active]
+            custom_pts = np.array(self.custom_grid_pts, dtype=np.float32) if self.custom_grid_pts else None
         
         self.lbl_grid.set_image(filtered_frame, auto_range=False)
         self.lbl_grid.set_points(pts_xy=ptsA, crosses_xy=custom_pts)
@@ -1500,10 +1651,10 @@ class MotionCorrectionGUI(QMainWindow):
         else:
             self.lbl_warped.set_image(None)
         
-        # Display displacement field if available
+        # Display displacement field if available (with smoothing for display)
         if self.disp_field is not None:
             disp_frame = self.disp_field[idx] if len(self.disp_field) > idx else self.disp_field[0]
-            disp_preview = self._make_disp_preview(disp_frame)
+            disp_preview = self._make_disp_preview(disp_frame)  # Apply smoothing here
             self.lbl_tracks.set_image(disp_preview, auto_range=False)
         else:
             self.lbl_tracks.set_image(None)
@@ -1539,6 +1690,38 @@ class MotionCorrectionGUI(QMainWindow):
         self.process_btn.setEnabled(False)
         self.load_btn.setEnabled(False)
 
+        # Prepare video input (apply filter if selected)
+        video_input = self.video_data
+        if self.current_filter and self.current_filter.lower() not in ("none", "raw"):
+            try:
+                self.status_label.setText(f"Applying filter '{self.current_filter}' to input frames...")
+                QApplication.processEvents()
+
+                vd = self.video_data
+                if isinstance(vd, torch.Tensor):
+                    vd = vd.detach().cpu().numpy()
+                
+                # vd is likely (T, C, H, W)
+                filtered_frames = []
+                for i in range(len(vd)):
+                    frame = vd[i]
+                    # If (C, H, W), transpose to (H, W, C) for apply_filter
+                    if frame.ndim == 3 and frame.shape[0] in [1, 3]: 
+                         frame = np.transpose(frame, (1, 2, 0))
+                    
+                    filt = self.apply_filter(frame, self.current_filter) # returns (H,W) uint8
+                    
+                    # Convert back to (3, H, W) float32 tensor
+                    ft = torch.from_numpy(filt).float()
+                    ft = ft.unsqueeze(0).repeat(3, 1, 1)
+                    filtered_frames.append(ft)
+                
+                video_input = torch.stack(filtered_frames, dim=0)
+
+            except Exception as e:
+                print(f"Error filtering input: {e}")
+                video_input = self.video_data
+
         base_active = self.base_grid_pts[self.base_grid_active].astype(np.float32)
         base_grid_tensor = torch.from_numpy(base_active).unsqueeze(0)
 
@@ -1555,11 +1738,12 @@ class MotionCorrectionGUI(QMainWindow):
             except Exception:
                 pass
 
-        self.worker = ProcessingWorker(self.video_data, base_grid_tensor, custom_pts_tensor, parent=self)
+        self.worker = ProcessingWorker(video_input, base_grid_tensor, custom_pts_tensor, parent=self)
         self.worker.tracks_ready.connect(self.on_tracks_ready)
         self.worker.finished.connect(self.on_processing_finished)
         self.worker.error.connect(self.on_processing_error)
         self.worker.progress.connect(self.on_progress)
+        self.worker.status_update.connect(self.status_label.setText)
         self.worker.start()
 
         self.stop_btn.setEnabled(True)
@@ -1618,6 +1802,10 @@ class MotionCorrectionGUI(QMainWindow):
 
         # Update display with final results, don't restart processing
         self.update_plot()
+        
+        # Ensure new panels are fitted correctly
+        QTimer.singleShot(100, lambda: self.lbl_warped.reset_view())
+        QTimer.singleShot(100, lambda: self.lbl_tracks.reset_view())
 
     def on_processing_error(self, error_msg):
         from PyQt6.QtWidgets import QMessageBox
