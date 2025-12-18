@@ -2,10 +2,9 @@ import sys
 import os
 import numpy as np
 import torch
-
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QPushButton, QSlider, QLabel, QVBoxLayout, QHBoxLayout,
-    QFileDialog, QLineEdit, QCheckBox, QGridLayout, QComboBox, QSpinBox, QSizePolicy, QProgressBar
+    QFileDialog, QLineEdit, QCheckBox, QGridLayout, QComboBox, QSpinBox, QSizePolicy, QProgressBar, QDialog
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QThread
 from PyQt6.QtGui import QImage, QPixmap, QPainter, QColor, QPalette
@@ -718,6 +717,24 @@ class PGImagePanel(pg.PlotWidget):
             self.vb.autoRange()
 
 
+class ParameterDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Parameters")
+        self.setModal(False) # Allow interacting with main window if needed? Or True for modal. User said "individual window", usually means modal or modeless. Let's stick to modal for simplicity or modeless if they want to tweak while seeing results. Modeless is better for tweaking.
+        
+        self.layout = QVBoxLayout(self)
+        self.layout.setContentsMargins(10, 10, 10, 10)
+        self.layout.setSpacing(10)
+        
+        # We will let the main window populate this layout with its widgets
+        # to preserve existing connections and logic.
+        
+        self.close_btn = QPushButton("Close")
+        self.close_btn.clicked.connect(self.hide)
+        self.layout.addWidget(self.close_btn)
+
+
 class MotionCorrectionGUI(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -929,15 +946,32 @@ class MotionCorrectionGUI(QMainWindow):
         main_layout.setContentsMargins(8, 8, 8, 8)
         main_layout.setSpacing(8)
 
-        controls = QWidget(central_widget)
-        controls_grid = QGridLayout(controls)
-        controls_grid.setContentsMargins(6, 6, 6, 6)
-        controls_grid.setHorizontalSpacing(3)  # Reduced from 8 to minimize gaps
-        controls_grid.setVerticalSpacing(4)
+        # --- Top Bar Controls ---
+        top_bar = QHBoxLayout()
+        top_bar.setSpacing(6)
+        main_layout.addLayout(top_bar)
 
+        # 1. Load File
         self.load_btn = QPushButton("Load File")
         self.load_btn.clicked.connect(self.select_file)
+        self.load_btn.setStyleSheet("font-size: 14px; font-weight: bold; padding: 5px;")
+        top_bar.addWidget(self.load_btn)
 
+        # 2. Filter
+        top_bar.addWidget(QLabel("Input Filter:"))
+        self.filter_combo = QComboBox()
+        self.filter_combo.addItems(["None", "Gaussian", "Sobel", "Canny edge"])
+        self.filter_combo.currentIndexChanged.connect(self.on_filter_changed)
+        top_bar.addWidget(self.filter_combo)
+
+        # 3. Edit Points
+        self.edit_points_btn = QCheckBox("Edit Points")
+        self.edit_points_btn.stateChanged.connect(self.toggle_edit_mode)
+        self.edit_points_btn.setEnabled(False)
+        top_bar.addWidget(self.edit_points_btn)
+
+        # 4. Preset
+        top_bar.addWidget(QLabel("Preset:"))
         self.preset_combo = QComboBox()
         self.preset_combo.addItems([
             "Regular grid",
@@ -945,14 +979,39 @@ class MotionCorrectionGUI(QMainWindow):
             "Activity map (motion)",
             "Segmentation centroids"
         ])
-
         self.preset_combo.currentIndexChanged.connect(self.on_preset_changed)
+        top_bar.addWidget(self.preset_combo)
 
-        self.filter_combo = QComboBox()
-        self.filter_combo.addItems(["None", "Gaussian", "Sobel", "Canny edge"])
-        self.filter_combo.currentIndexChanged.connect(self.on_filter_changed)
+        # 5. Parameters
+        self.settings_btn = QPushButton("⚙️ Parameters")
+        self.settings_btn.clicked.connect(self.open_parameter_dialog)
+        top_bar.addWidget(self.settings_btn)
 
-        self.lbl_filter = QLabel("Filter:")
+        # 6. Run Registration
+        self.process_btn = QPushButton("Run Registration")
+        self.process_btn.clicked.connect(self.visualize)
+        self.process_btn.setEnabled(False)
+        self.process_btn.setStyleSheet("font-size: 14px; font-weight: bold; padding: 5px;")
+        top_bar.addWidget(self.process_btn)
+
+        # 7. Stop
+        self.stop_btn = QPushButton("Stop")
+        self.stop_btn.clicked.connect(self.stop_processing)
+        self.stop_btn.setEnabled(False)
+        top_bar.addWidget(self.stop_btn)
+
+        # 8. Save
+        self.save_btn = QPushButton("💾 Save Results")
+        self.save_btn.clicked.connect(self.save_results)
+        self.save_btn.setEnabled(False)  # Enabled when results exist
+        top_bar.addWidget(self.save_btn)
+        
+        # Add filler to push buttons to left (optional)
+        top_bar.addStretch(1)
+
+
+        # --- Parameter Widgets (Detailed) ---
+        # These are created here but added to the ParameterDialog instead of main window
         self.num_points_spin = QSpinBox()
         self.num_points_spin.setRange(10, 5000)
         self.num_points_spin.setValue(400)
@@ -963,99 +1022,78 @@ class MotionCorrectionGUI(QMainWindow):
         self.min_dist_spin.setValue(10)
         self.min_dist_spin.valueChanged.connect(self.on_preset_params_changed)
 
-        self.apply_preset_btn = QPushButton("Apply Preset")
-        self.apply_preset_btn.clicked.connect(self.apply_point_preset)
-
         self.grid_rows_ctrl = QLineEdit(str(getattr(self, "grid_rows", 4)))
         self.grid_cols_ctrl = QLineEdit(str(getattr(self, "grid_cols", 4)))
 
-        self.process_btn = QPushButton("Run Registration")
-        self.process_btn.clicked.connect(self.visualize)
-        self.process_btn.setEnabled(False)
-
-        self.stop_btn = QPushButton("Stop")
-        self.stop_btn.clicked.connect(self.stop_processing)
-        self.stop_btn.setEnabled(False)
-
-        self.edit_points_btn = QCheckBox("Edit Points")
-        self.edit_points_btn.stateChanged.connect(self.toggle_edit_mode)
-        self.edit_points_btn.setEnabled(False)
-
-        self.clear_points_btn = QPushButton("Clear Points")
-        self.clear_points_btn.clicked.connect(self.clear_points)
-        self.clear_points_btn.setEnabled(False)
-
-        self.undo_btn = QPushButton("Undo All")
-        self.undo_btn.clicked.connect(self.undo_all_changes)
-        self.undo_btn.setEnabled(False)
-
-        self.reset_zoom_btn = QPushButton("Reset Zoom")
-        self.reset_zoom_btn.clicked.connect(self.reset_all_zoom)
-
-        self.sync_view_chk = QCheckBox("Sync view")
-        self.sync_view_chk.stateChanged.connect(self.on_sync_view_toggled)
+        self.apply_preset_btn = QPushButton("Apply to Grid")
+        self.apply_preset_btn.clicked.connect(self.apply_point_preset)
 
         self.df_sigma_spin = QSpinBox()
         self.df_sigma_spin.setRange(0, 20)
         self.df_sigma_spin.setValue(3)
         self.df_sigma_spin.valueChanged.connect(lambda *_: self.update_plot())
+        
+        self.lbl_N = QLabel("Number of Points:")
+        self.lbl_minDist = QLabel("Min Distance:")
+        self.lbl_rows = QLabel("Rows:")
+        self.lbl_cols = QLabel("Cols:")
+        self.lbl_sigma = QLabel("DF Smoothing (σ):")
+        
+        self.sync_view_chk = QCheckBox("Sync view")
+        self.sync_view_chk.stateChanged.connect(self.on_sync_view_toggled)
 
+        self.clear_points_btn = QPushButton("Clear Custom Points")
+        self.clear_points_btn.clicked.connect(self.clear_points)
+        self.clear_points_btn.setEnabled(False)
+
+        self.undo_btn = QPushButton("Reset to Preset")
+        self.undo_btn.clicked.connect(self.undo_all_changes)
+        self.undo_btn.setEnabled(False)
+        
+        self.reset_zoom_btn = QPushButton("Reset Zoom")
+        self.reset_zoom_btn.clicked.connect(self.reset_all_zoom)
+
+
+        # --- Initialize Dialog ---
+        self.param_dialog = ParameterDialog(self)
+        pd_layout = self.param_dialog.layout
+
+        # Add widgets to dialog layout
+        
+        # Parameters section
+        pd_layout.addWidget(self.lbl_rows)
+        pd_layout.addWidget(self.grid_rows_ctrl)
+        pd_layout.addWidget(self.lbl_cols)
+        pd_layout.addWidget(self.grid_cols_ctrl)
+        
+        pd_layout.addWidget(self.lbl_N)
+        pd_layout.addWidget(self.num_points_spin)
+        pd_layout.addWidget(self.lbl_minDist)
+        pd_layout.addWidget(self.min_dist_spin)
+        
+        pd_layout.addWidget(self.apply_preset_btn)
+        
+        pd_layout.addWidget(QLabel("---"))
+        
+        pd_layout.addWidget(self.lbl_sigma)
+        pd_layout.addWidget(self.df_sigma_spin)
+        
+        pd_layout.addWidget(QLabel("---"))
+        
+        pd_layout.addWidget(self.sync_view_chk)
+        pd_layout.addWidget(self.reset_zoom_btn)
+        pd_layout.addWidget(self.clear_points_btn)
+        pd_layout.addWidget(self.undo_btn)
+
+        # Move close button to bottom
+        pd_layout.removeWidget(self.param_dialog.close_btn)
+        pd_layout.addWidget(self.param_dialog.close_btn)
+        
         self.points_label = QLabel("Points: 0")
         self.status_label = QLabel("Ready - Drag & drop video or use Load button")
         self.status_label.setWordWrap(True)
-
-        self.lbl_N = QLabel("N:")
-        self.lbl_minDist = QLabel("MinDist:")
-        self.lbl_rows = QLabel("Rows:")
-        self.lbl_cols = QLabel("Cols:")
-
-        # Row 0: Load File, Sync View, DF Gaussian, Filter
-        c = 0
-        controls_grid.addWidget(self.load_btn, 0, c); c += 1
-        controls_grid.addWidget(self.sync_view_chk, 0, c); c += 1
-        controls_grid.addWidget(QLabel("DF σ:"), 0, c); c += 1
-        controls_grid.addWidget(self.df_sigma_spin, 0, c); c += 1
-        controls_grid.addWidget(self.lbl_filter, 0, c); c += 1
-        controls_grid.addWidget(self.filter_combo, 0, c); c += 1
-        controls_grid.addWidget(self.reset_zoom_btn, 0, c); c += 1
-        ncols = max(c, 0)
-
-        # Row 1: Preset, Apply Preset, Run Registration
-        c = 0
-        controls_grid.addWidget(QLabel("Preset:"), 1, c); c += 1
-        controls_grid.addWidget(self.preset_combo, 1, c); c += 1
-        controls_grid.addWidget(self.apply_preset_btn, 1, c); c += 1
-        controls_grid.addWidget(self.process_btn, 1, c); c += 1
-        controls_grid.addWidget(self.stop_btn, 1, c); c += 1
-  
-        
-        # Fixed positions for parameter controls
-        # These controls occupy the same grid positions but are toggled with visibility
-        param_col = c  # Start of parameter section (column 5)
-        # Grid controls (rows/cols) - shown for "Regular grid" preset
-        controls_grid.addWidget(self.lbl_rows, 1, param_col, 1, 1)
-        controls_grid.addWidget(self.grid_rows_ctrl, 1, param_col + 1, 1, 1)
-        controls_grid.addWidget(self.lbl_cols, 1, param_col + 2, 1, 1)
-        controls_grid.addWidget(self.grid_cols_ctrl, 1, param_col + 3, 1, 1)
-        # Feature controls (N/minDist) - shown for other presets, occupy same positions
-        controls_grid.addWidget(self.lbl_N, 1, param_col, 1, 1)
-        controls_grid.addWidget(self.num_points_spin, 1, param_col + 1, 1, 1)
-        controls_grid.addWidget(self.lbl_minDist, 1, param_col + 2, 1, 1)
-        controls_grid.addWidget(self.min_dist_spin, 1, param_col + 3, 1, 1)
-        
-        ncols = max(ncols, param_col + 4)
-
-        # Row 2: Point editing controls
-        c = 0
-        controls_grid.addWidget(self.edit_points_btn, 2, c); c += 1
-        controls_grid.addWidget(self.clear_points_btn, 2, c); c += 1
-        controls_grid.addWidget(self.undo_btn, 2, c); c += 1
-        controls_grid.addWidget(self.points_label, 2, c); c += 1
-        ncols = max(ncols, c)
-
-        # Row 3: Status label (spans all columns)
-        controls_grid.addWidget(self.status_label, 3, 0, 1, ncols)
-        main_layout.addWidget(controls)
+        main_layout.addWidget(self.status_label)
+        main_layout.addWidget(self.points_label) # Put points label on main window or dialog? User didn't specify. Keeping on main seems useful.
         
 
         self.grid_widget = QWidget(central_widget)
@@ -1695,6 +1733,10 @@ class MotionCorrectionGUI(QMainWindow):
         if self.video_data is None:
             return
 
+        # Ensure Edit Points is inactive
+        if self.edit_points_btn.isChecked():
+             self.edit_points_btn.setChecked(False)
+
         self.timer.stop()
         self.is_playing = False
         self.play_btn.setText("▶")
@@ -1820,6 +1862,7 @@ class MotionCorrectionGUI(QMainWindow):
 
         self.status_label.setText("Processing complete")
         self.process_btn.setEnabled(True)
+        self.save_btn.setEnabled(True)  # Enable save button
         self.load_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.progress_bar.setValue(100)
@@ -1963,6 +2006,74 @@ class MotionCorrectionGUI(QMainWindow):
             except Exception:
                 pass
         super().closeEvent(event)
+
+    def open_parameter_dialog(self):
+        self.param_dialog.show()
+        self.param_dialog.raise_()
+        self.param_dialog.activateWindow()
+
+    def save_results(self):
+        if self.warped_video is None:
+             return
+        
+        # Default filename based on input video name
+        default_name = "output.mp4"
+        if self.video_path:
+             base = os.path.splitext(os.path.basename(self.video_path))[0]
+             default_name = f"{base}_warped.mp4"
+
+        path, _ = QFileDialog.getSaveFileName(self, "Save Warped Video", default_name, "MP4 Video (*.mp4);;All Files (*.*)")
+        if not path:
+             return
+             
+        try:
+            from mc_cotracker import save_and_display_video
+            
+            # Save video
+            # self.warped_video is likely list or numpy array of frames
+            # save_and_display_video expects numpy array (T,H,W) uint8 or float? 
+            # It handles normalization.
+            
+            vid = np.asarray(self.warped_video)
+            if vid.ndim == 3: # (T, H, W) -> need to be careful if it expects channel?
+                 pass 
+            
+            # The tool in mc_cotracker uses cv2.COLOR_GRAY2BGR, so it expects 2D frames (T,H,W)
+            save_and_display_video(vid, path, fps=30)
+            
+            # Also save tracks?
+            tracks_path = os.path.splitext(path)[0] + "_tracks.npy"
+            csv_path = os.path.splitext(path)[0] + "_tracks.csv"
+            
+            if self.viz_data.get('tracks') is not None:
+                 tracks = self.viz_data['tracks'] # (T, N, 2)
+                 np.save(tracks_path, tracks)
+                 
+                 # Export to CSV
+                 try:
+                     import csv
+                     with open(csv_path, 'w', newline='') as f:
+                         writer = csv.writer(f)
+                         writer.writerow(["Frame", "PointID", "X", "Y"])
+                         
+                         T, N, _ = tracks.shape
+                         for t in range(T):
+                             for n in range(N):
+                                 x, y = tracks[t, n]
+                                 writer.writerow([t, n, x, y])
+                                 
+                     self.status_label.setText(f"Saved to {path}, {tracks_path}, and {csv_path}")
+                 except Exception as e:
+                     print(f"Error saving CSV: {e}")
+                     self.status_label.setText(f"Saved to {path} and {tracks_path} (CSV failed)")
+
+            else:
+                 self.status_label.setText(f"Saved to {path}")
+                 
+        except Exception as e:
+            self.status_label.setText(f"Error saving: {e}")
+            print(e)
+
 
 
 if __name__ == "__main__":
