@@ -1099,9 +1099,24 @@ class MotionCorrectionGUI(QMainWindow):
 
         playback_layout = QHBoxLayout()
 
-        self.play_btn = QPushButton("⏯️")
+        self.play_btn = QPushButton("▶")
         self.play_btn.clicked.connect(self.toggle_playback)
         self.play_btn.setEnabled(False)
+        self.play_btn.setStyleSheet("""
+            QPushButton {
+                font-size: 24px; 
+                color: #0078D7; 
+                font-weight: bold;
+                border: 2px solid #0078D7;
+                border-radius: 5px;
+                padding: 5px;
+                min-width: 40px;
+            }
+            QPushButton:disabled {
+                color: #A0A0A0;
+                border-color: #A0A0A0;
+            }
+        """)
 
         self.step_back_btn = QPushButton("◀")
         self.step_back_btn.clicked.connect(self.step_backward)
@@ -1134,11 +1149,26 @@ class MotionCorrectionGUI(QMainWindow):
         playback_layout.addWidget(self.play_btn)
         playback_layout.addWidget(self.step_back_btn)
         playback_layout.addWidget(self.step_fwd_btn)
-        playback_layout.addWidget(self.speed_slider)
-        playback_layout.addWidget(self.speed_label)
-        playback_layout.addWidget(self.slider, stretch=1)
-        playback_layout.addWidget(self.frame_label)
-        playback_layout.addWidget(self.progress_bar)
+
+        # Speed control with label on top
+        speed_layout = QVBoxLayout()
+        speed_header_layout = QHBoxLayout() # To put Speed and 1.00x next to each other
+        speed_header_layout.addWidget(QLabel("Speed"))
+        speed_header_layout.addWidget(self.speed_label)
+        speed_layout.addLayout(speed_header_layout)
+        speed_layout.addWidget(self.speed_slider)
+        playback_layout.addLayout(speed_layout)
+
+        # Frames control with label on top
+        frames_layout = QVBoxLayout()
+        frames_header_layout = QHBoxLayout() # To put Frames and 0/0 next to each other
+        frames_header_layout.addWidget(QLabel("Frames"))
+        frames_header_layout.addWidget(self.frame_label)
+        frames_layout.addLayout(frames_header_layout)
+        frames_layout.addWidget(self.slider)
+        playback_layout.addLayout(frames_layout, stretch=1)
+
+        # playback_layout.addWidget(self.progress_bar) # Removed as requested
 
         main_layout.addLayout(playback_layout)
 
@@ -1436,6 +1466,7 @@ class MotionCorrectionGUI(QMainWindow):
 
             self.play_btn.setEnabled(True)
             self.step_fwd_btn.setEnabled(True)
+            self.step_back_btn.setEnabled(True)
 
             self.update_plot()
             QTimer.singleShot(100, lambda: self.reset_all_zoom())
