@@ -57,7 +57,7 @@ def load_tiff(path, frames: int = 50):
 
     # If endian is non-native, fix it
     if not video.dtype.isnative:
-        video = video.byteswap().newbyteorder()
+        video = video.astype(video.dtype.type)
 
     return to_uint8_contrast(video)
 
