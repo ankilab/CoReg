@@ -198,7 +198,7 @@ def warping(predicted_tracks, frames, smoothing=3,
 
         for t in range(T):
             dx_dense[t] = griddata(
-                (sparse_x[t], sparse_y[t]),
+                (sparse_x[0], sparse_y[0]), # Use frame 0 coordinates as reference
                 disp_sparse[t, :, 0],
                 (X, Y),
                 method="linear",
@@ -206,7 +206,7 @@ def warping(predicted_tracks, frames, smoothing=3,
             ).astype(np.float32)
 
             dy_dense[t] = griddata(
-                (sparse_x[t], sparse_y[t]),
+                (sparse_x[0], sparse_y[0]),
                 disp_sparse[t, :, 1],
                 (X, Y),
                 method="linear",
