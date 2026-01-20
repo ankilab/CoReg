@@ -57,7 +57,7 @@ def to_uint8_contrast(video16, p_low=1, p_high=99.8):
     v = np.clip((v - lo) / (hi - lo + 1e-6), 0, 1)
     return (v * 255).astype(np.uint8)
 
-def load_hdf5(h5_path, dataset_path, frames: int = 200, resize=True, size=(256, 256)):
+def load_hdf5(h5_path, dataset_path, frames: int = None, resize=True, size=(256, 256)):
     h5_path = Path(h5_path)
     if not h5_path.exists():
         raise FileNotFoundError(f"File not found: {h5_path}")
@@ -66,7 +66,10 @@ def load_hdf5(h5_path, dataset_path, frames: int = 200, resize=True, size=(256, 
         if dataset_path not in h5:
             raise KeyError(f"Dataset '{dataset_path}' not found in file.")
         ds = h5[dataset_path]
-        video = np.array(ds[:frames])
+        if frames is not None:
+            video = np.array(ds[:frames])
+        else:
+            video = np.array(ds[:])
 
     # video should be (T,H,W) typically
     if video.ndim == 2:
@@ -80,11 +83,11 @@ def load_hdf5(h5_path, dataset_path, frames: int = 200, resize=True, size=(256, 
     v_thwc = _maybe_resize_video_THWC(v_thwc, resize=resize, size=size)
     return _to_torch_TCHW(v_thwc)
 
-def load_tiff(path, frames: int = 50, resize: bool = True, size=(256, 256)):
+def load_tiff(path, frames: int = None, resize: bool = True, size=(256, 256)):
     mm = tifffile.memmap(path)
 
     if mm.ndim == 3:
-        T = min(int(frames), mm.shape[0])
+        T = min(int(frames), mm.shape[0]) if frames is not None else mm.shape[0]
         video = np.ascontiguousarray(mm[:T])
     elif mm.ndim == 2:
         video = np.ascontiguousarray(mm[None, ...])
@@ -105,7 +108,7 @@ def load_tiff(path, frames: int = 50, resize: bool = True, size=(256, 256)):
 
     return _to_torch_TCHW(v_thwc)
 
-def load_video(file: str, resize: bool = True, size=(256, 256), max_frames: int = 20):
+def load_video(file: str, resize: bool = True, size=(256, 256), max_frames: int = None):
     """
     Load a video from the given file path and return a torch tensor (T, C, H, W).
 
@@ -162,8 +165,20 @@ def save_and_display_video(array, filename='output.mp4', fps=30):
 
     for i in range(num_frames):
         frame = array[i]
-        frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)  # <- This line is critical
-        out.write(frame)
+        # Check if frame is already 3-channel (RGB) or needs conversion from grayscale
+        if frame.ndim == 2:
+            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+        elif frame.ndim == 3:
+            if frame.shape[2] == 3:
+                # RGB to BGR for OpenCV
+                frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            else:
+                # Fallback or other channel counts
+                frame_bgr = frame
+        else:
+            frame_bgr = frame
+            
+        out.write(frame_bgr)
 
     out.release()
     print(f"Video saved to {filename}")
