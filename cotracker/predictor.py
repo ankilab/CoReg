@@ -305,5 +305,5 @@ class CoTrackerOnlinePredictor(torch.nn.Module):
                     (H - 1) / (self.interp_shape[0] - 1),
                 ]
             ),
-            visibilities > thr,
+            visibilities > thr
         )

@@ -12,7 +12,7 @@ import cv2
 from scipy.ndimage import gaussian_filter, zoom
 import numpy as np
 import torch.nn.functional as F
-import torch_lddmm
+import utils.torch_lddmm as torch_lddmm
 import ants
 from PIL import Image
 

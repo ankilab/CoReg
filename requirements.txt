@@ -1,0 +1,13 @@
+numpy
+opencv-python
+PyQt6
+pyqtgraph
+torch
+torchvision
+pillow
+imageio
+matplotlib
+scipy
+tifffile
+h5py
+hdf5plugin
