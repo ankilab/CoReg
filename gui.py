@@ -17,15 +17,15 @@ try:
 except ImportError:
     ants = None
 try:
-    import torch_lddmm
+    import utils.torch_lddmm as torch_lddmm
 except ImportError:
     torch_lddmm = None
 
 # Add current directory to path to allow imports
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-import mc_cotracker
+import utils.mc_cotracker as mc_cotracker
 mc_cotracker.DEFAULT_DEVICE = 'cuda'
-from mc_cotracker import cotrack_model, warping
+from utils.mc_cotracker import cotrack_model, warping
 from utils.utils import load_video, load_tiff, load_hdf5
 pg.setConfigOptions(imageAxisOrder='row-major')  # damit (H,W) wie numpy angezeigt wird
 from utils.utils import video_ssim_score
@@ -4151,7 +4151,7 @@ class MotionCorrectionGUI(QMainWindow):
                 save_video_hdf5(vid, path)
             else:
                 # Default to MP4
-                from mc_cotracker import save_and_display_video
+                from utils.mc_cotracker import save_and_display_video
                 # Ensure path ends with mp4 if not present (though dialog usually handles it)
                 if not ext:
                     path += ".mp4"
