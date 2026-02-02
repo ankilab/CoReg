@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "coreg"             # this is the *pip install name* (can be whatever)
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "opencv-python",
+    "PyQt6",
+    "pyqtgraph",
+    "torch",
+    "torchvision",
+    "pillow",
+    "imageio",
+    "matplotlib",
+    "scipy",
+    "tifffile",
+    "h5py",
+    "hdf5plugin",
+    "IPython",
+    "imageio[pyav]",    
+    "imageio[ffmpeg]",
+    ]
+
+[tool.setuptools]
+package-dir = {"" = "src/CoReg"}
+py-modules = ["gui"]        # this includes src/CoReg/gui.py as an installable module
+
+[tool.setuptools.packages.find]
+where = ["src/CoReg"]
+include = ["cotracker*", "utils*"]
+
+[project.scripts]
+coreg-gui = "gui:main"

@@ -11,3 +11,8 @@ scipy
 tifffile
 h5py
 hdf5plugin
+IPython
+imageio[pyav]
+imageio[ffmpeg]
+torch --index-url https://download.pytorch.org/whl/cu126
+torchvision --index-url https://download.pytorch.org/whl/cu126
