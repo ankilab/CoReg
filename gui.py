@@ -5,7 +5,7 @@ import torch
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QPushButton, QSlider, QLabel, QVBoxLayout, QHBoxLayout,
     QFileDialog, QLineEdit, QCheckBox, QGridLayout, QComboBox, QSpinBox, QSizePolicy, QProgressBar, QDialog,
-    QGraphicsRectItem, QDoubleSpinBox, QScrollArea
+    QGraphicsRectItem, QDoubleSpinBox, QScrollArea, QMessageBox
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QThread, QElapsedTimer
 from PyQt6.QtGui import QImage, QPixmap, QPainter, QColor, QPalette
@@ -331,288 +331,6 @@ class ProcessingWorker(QThread):
 
 
 
-
-class ImageLabel(QLabel):
-    """Zoom/pan QLabel as a viewport. Zoom=1 fits image to panel. No window resizing side-effects."""
-    pressed = pyqtSignal(int, int, int)  # x, y, button_value
-    moved = pyqtSignal(int, int)
-    released = pyqtSignal()
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.setMinimumSize(10, 10)
-
-        self.zoom_factor = 1.0
-        self.pan_offset = [0.0, 0.0]
-        self._base_image = None
-        self._overlay_data = {}
-
-        self._fit_scale = 1.0
-        self._is_panning = False
-        self._pan_start = None
-
-        self._viewport_pixmap = QPixmap()
-
-        # Alt + Left drag to pan (keeps left-drag free for editing points)
-        self.left_pan_modifier = Qt.KeyboardModifier.AltModifier
-
-    def setPixmap(self, pixmap, overlay_data=None):
-        self._base_image = pixmap if isinstance(pixmap, QPixmap) else QPixmap(pixmap)
-        self._overlay_data = overlay_data if overlay_data else {}
-        self._update_fit_scale()
-        self._redraw_viewport()
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self._update_fit_scale()
-        self._redraw_viewport()
-
-    def _update_fit_scale(self):
-        if self._base_image is None or self._base_image.isNull():
-            self._fit_scale = 1.0
-            return
-        bw, bh = self._base_image.width(), self._base_image.height()
-        if bw <= 0 or bh <= 0 or self.width() <= 0 or self.height() <= 0:
-            self._fit_scale = 1.0
-            return
-        self._fit_scale = min(self.width() / bw, self.height() / bh)
-
-    def _draw_position_and_scale(self):
-        if self._base_image is None or self._base_image.isNull():
-            return None
-
-        bw, bh = self._base_image.width(), self._base_image.height()
-        scale = self._fit_scale * self.zoom_factor
-        sw = bw * scale
-        sh = bh * scale
-
-        wx, wy = self.width(), self.height()
-        x0 = (wx - sw) * 0.5 + self.pan_offset[0]
-        y0 = (wy - sh) * 0.5 + self.pan_offset[1]
-        return (x0, y0, sw, sh, scale)
-
-    def _redraw_viewport(self):
-        if self.width() <= 0 or self.height() <= 0:
-            return
-
-        self._viewport_pixmap = QPixmap(self.width(), self.height())
-        bg = self.palette().color(QPalette.ColorRole.Window)
-        self._viewport_pixmap.fill(bg)
-
-        if self._base_image is None or self._base_image.isNull():
-            super().setPixmap(self._viewport_pixmap)
-            return
-
-        geom = self._draw_position_and_scale()
-        if geom is None:
-            super().setPixmap(self._viewport_pixmap)
-            return
-
-        x0, y0, sw, sh, scale = geom
-
-        painter = QPainter(self._viewport_pixmap)
-        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-
-        scaled = self._base_image.scaled(
-            int(round(sw)), int(round(sh)),
-            Qt.AspectRatioMode.IgnoreAspectRatio,
-            Qt.TransformationMode.SmoothTransformation
-        )
-        painter.drawPixmap(int(round(x0)), int(round(y0)), scaled)
-
-        self._draw_overlays(painter, x0, y0, scale)
-
-        painter.end()
-        super().setPixmap(self._viewport_pixmap)
-
-    def _img_to_widget(self, x_img, y_img, x0, y0, scale):
-        xw = x0 + x_img * scale
-        yw = y0 + y_img * scale
-        return int(round(xw)), int(round(yw))
-
-    def _draw_overlays(self, painter, x0, y0, scale):
-        if not self._overlay_data:
-            return
-
-        if 'points' in self._overlay_data:
-            for pts, color, radius in self._overlay_data['points']:
-                if pts is None or len(pts) == 0:
-                    continue
-                qcolor = QColor(color[0], color[1], color[2])
-                painter.setBrush(qcolor)
-                painter.setPen(qcolor)
-                r = max(1, int(round(radius * scale)))
-                for pt in pts:
-                    xw, yw = self._img_to_widget(pt[0], pt[1], x0, y0, scale)
-                    painter.drawEllipse(xw - r, yw - r, 2 * r, 2 * r)
-
-        if 'crosses' in self._overlay_data:
-            for pts, color, size in self._overlay_data['crosses']:
-                if pts is None or len(pts) == 0:
-                    continue
-                qcolor = QColor(color[0], color[1], color[2])
-                painter.setPen(qcolor)
-                s = max(2, int(round(size * scale)))
-                for pt in pts:
-                    xw, yw = self._img_to_widget(pt[0], pt[1], x0, y0, scale)
-                    painter.drawLine(xw - s, yw - s, xw + s, yw + s)
-                    painter.drawLine(xw - s, yw + s, xw + s, yw - s)
-
-        if 'trajectories' in self._overlay_data:
-            tracks, current_frame, trail_length, color = self._overlay_data['trajectories']
-            tracks = np.asarray(tracks)
-
-            if tracks.ndim == 4:
-                tracks = tracks[0]  # (T,N,2)
-
-            T = tracks.shape[0]
-            if T < 2:
-                return
-
-            cf = int(np.clip(current_frame, 0, T - 1))
-
-            # retrospective segment index t means: draw (t-1) -> t
-            start_t = max(1, cf - int(trail_length))
-            end_t   = cf
-
-            # only draw if the point actually moved (in image pixels)
-            eps_px = 0.5
-            eps2 = eps_px * eps_px
-
-            blue   = (255,255,0)
-            purple = (160, 0, 255)
-
-            den = max(1, end_t - start_t)  # for ramp within the visible trail
-
-            for point_idx in range(tracks.shape[1]):
-                for t in range(start_t, end_t + 1):
-                    pt1 = tracks[t - 1, point_idx]  # previous frame
-                    pt2 = tracks[t,     point_idx]  # current frame
-                    if not (np.isfinite(pt1).all() and np.isfinite(pt2).all()):
-                        continue
-
-                    dx = float(pt2[0] - pt1[0])
-                    dy = float(pt2[1] - pt1[1])
-                    if (dx*dx + dy*dy) < eps2:
-                        continue  # no movement -> don't draw
-
-                    u = (t - start_t) / den  # 0..1 along the retrospective trail
-
-                    r = int(round(blue[0]   + (purple[0] - blue[0]) * u))
-                    g = int(round(blue[1]   + (purple[1] - blue[1]) * u))
-                    b = int(round(blue[2]   + (purple[2] - blue[2]) * u))
-
-                    qcolor = QColor(r, g, b, 255)
-                    pen = painter.pen()
-                    pen.setColor(qcolor)
-                    pen.setWidth(max(1, int(round(2 * scale))))
-                    painter.setPen(pen)
-
-                    x1, y1 = self._img_to_widget(pt1[0], pt1[1], x0, y0, scale)
-                    x2, y2 = self._img_to_widget(pt2[0], pt2[1], x0, y0, scale)
-                    painter.drawLine(x1, y1, x2, y2)
-
-    def _map_to_image(self, pos):
-        if self._base_image is None or self._base_image.isNull():
-            return int(pos.x()), int(pos.y())
-
-        geom = self._draw_position_and_scale()
-        if geom is None:
-            return int(pos.x()), int(pos.y())
-
-        x0, y0, sw, sh, scale = geom
-
-        x_img = (pos.x() - x0) / scale
-        y_img = (pos.y() - y0) / scale
-
-        x_img = max(0.0, min(self._base_image.width() - 1.0, x_img))
-        y_img = max(0.0, min(self._base_image.height() - 1.0, y_img))
-        return int(round(x_img)), int(round(y_img))
-
-    def wheelEvent(self, event):
-        if self._base_image is None or self._base_image.isNull():
-            event.accept()
-            return
-
-        delta = event.angleDelta().y()
-        if delta == 0:
-            event.accept()
-            return
-
-        old_zoom = self.zoom_factor
-        self.zoom_factor *= (1.1 if delta > 0 else 1 / 1.1)
-        self.zoom_factor = max(0.1, min(10.0, self.zoom_factor))
-
-        mouse = event.position()
-        geom = self._draw_position_and_scale()
-        if geom is not None and self.zoom_factor != old_zoom:
-            x0, y0, sw, sh, old_scale = geom
-            x_img = (mouse.x() - x0) / old_scale
-            y_img = (mouse.y() - y0) / old_scale
-
-            new_scale = self._fit_scale * self.zoom_factor
-            new_sw = self._base_image.width() * new_scale
-            new_sh = self._base_image.height() * new_scale
-
-            new_x0 = mouse.x() - x_img * new_scale
-            new_y0 = mouse.y() - y_img * new_scale
-
-            wx, wy = self.width(), self.height()
-            centered_x0 = (wx - new_sw) * 0.5
-            centered_y0 = (wy - new_sh) * 0.5
-            self.pan_offset[0] = new_x0 - centered_x0
-            self.pan_offset[1] = new_y0 - centered_y0
-
-        self._redraw_viewport()
-        event.accept()
-
-    # def mousePressEvent(self, event):
-    #     is_left_pan = (event.button() == Qt.MouseButton.LeftButton and
-    #                    (event.modifiers() & self.left_pan_modifier))
-    #     is_mid_pan = (event.button() == Qt.MouseButton.MiddleButton)
-
-    #     if is_mid_pan or is_left_pan:
-    #         self._is_panning = True
-    #         self._pan_start = [event.position().x(), event.position().y()]
-    #         self.setCursor(Qt.CursorShape.ClosedHandCursor)
-    #         event.accept()
-    #         return
-
-    #     x, y = self._map_to_image(event.position())
-    #     self.pressed.emit(x, y, event.button().value)
-    #     event.accept()
-
-    # def mouseMoveEvent(self, event):
-    #     if self._is_panning and self._pan_start is not None:
-    #         dx = event.position().x() - self._pan_start[0]
-    #         dy = event.position().y() - self._pan_start[1]
-    #         self.pan_offset[0] += dx
-    #         self.pan_offset[1] += dy
-    #         self._pan_start = [event.position().x(), event.position().y()]
-    #         self._redraw_viewport()
-    #         event.accept()
-    #         return
-
-    #     x, y = self._map_to_image(event.position())
-    #     self.moved.emit(x, y)
-    #     event.accept()
-
-    # def mouseReleaseEvent(self, event):
-    #     if self._is_panning and event.button() in (Qt.MouseButton.MiddleButton, Qt.MouseButton.LeftButton):
-    #         self._is_panning = False
-    #         self._pan_start = None
-    #         self.setCursor(Qt.CursorShape.ArrowCursor)
-    #     self.released.emit()
-    #     event.accept()
-
-    def reset_zoom(self):
-        self.zoom_factor = 1.0
-        self.pan_offset = [0.0, 0.0]
-        self._redraw_viewport()
-
 class PGImagePanel(pg.PlotWidget):
     pressed  = pyqtSignal(float, float, int)   # x,y,button (1/2/3)
     moved    = pyqtSignal(float, float)
@@ -657,8 +375,10 @@ class PGImagePanel(pg.PlotWidget):
 
         self.img_item = pg.ImageItem()
         self.addItem(self.img_item)
-        self.pending_item = pg.ScatterPlotItem(size=10, pen=None, brush=pg.mkBrush(255, 80, 80, 220), symbol='x')
+        self.pending_item = pg.ScatterPlotItem(size=10, pen=None, brush=pg.mkBrush(57, 255, 20), symbol='o')
         self.addItem(self.pending_item)
+
+
 
         # keep full-resolution rendering (no auto decimation)
         try:
@@ -679,12 +399,43 @@ class PGImagePanel(pg.PlotWidget):
             self.traj_items.append(it)
             self.addItem(it)
         
+        self.img_item.setZValue(0)
+        self.traj_item.setZValue(5)
+        for it in self.traj_items:
+            it.setZValue(5)
+
+        self.points_item.setZValue(10)
+        self.pending_item.setZValue(11)
+        self.cross_item.setZValue(12)
+
 
         self.scene().sigMouseMoved.disconnect(self._on_mouse_moved) if hasattr(self, '_on_mouse_moved') else None
         self.scene().sigMouseClicked.disconnect(self._on_mouse_clicked) if hasattr(self, '_on_mouse_clicked') else None
         
         self.last_mouse_pos = None
         self._possible_click = False
+
+    def fit_view_to_image_and_points(self, pts_xy=None, margin=20):
+        """Expand view to show full image plus any points outside image bounds."""
+        if self._img_w is None or self._img_h is None:
+            return
+
+        x0, x1 = 0.0, float(self._img_w - 1)
+        y0, y1 = 0.0, float(self._img_h - 1)
+
+        if pts_xy is not None and len(pts_xy) > 0:
+            p = np.asarray(pts_xy, dtype=float)
+            if np.isfinite(p).any():
+                x0 = min(x0, float(np.nanmin(p[:, 0])))
+                x1 = max(x1, float(np.nanmax(p[:, 0])))
+                y0 = min(y0, float(np.nanmin(p[:, 1])))
+                y1 = max(y1, float(np.nanmax(p[:, 1])))
+
+        self.vb.setRange(
+            xRange=(x0 - margin, x1 + margin),
+            yRange=(y0 - margin, y1 + margin),
+            padding=0.0
+        )
 
     def _trail_color(self, u):
         # u in [0..1]
@@ -757,52 +508,7 @@ class PGImagePanel(pg.PlotWidget):
         scene_pos = self.mapToScene(pos.toPoint() if hasattr(pos, 'toPoint') else pos)
         view_pos = self.vb.mapSceneToView(scene_pos)
         
-        x = max(0, min(self._img_w - 1, view_pos.x()))
-        y = max(0, min(self._img_h - 1, view_pos.y()))
-        return x, y
-
-    def mousePressEvent(self, event):
-        # Check if Box Fill mode is active first
-        box_fill_active = False  # Box Fill feature removed
-        
-        if event.button() == Qt.MouseButton.LeftButton:
-            # Check if anyone is connected to our pressed signal
-            if self.receivers(self.pressed) > 0:
-                x, y = self._map_to_image(event.position())
-                self.pressed.emit(float(x), float(y), 1)
-                
-                # If Box Fill is active, completely block the event from going to ViewBox
-                if box_fill_active:
-                    self._custom_drag_active = True
-                    event.accept()
-                    # Do NOT call super() - this prevents ViewBox from seeing the event
-                    return
-                else:
-                    # Allow panning when Box Fill is off
-                    self._custom_drag_active = False
-        
-        if event.button() == Qt.MouseButton.RightButton:
-            x, y = self._map_to_image(event.position())
-            self.pressed.emit(float(x), float(y), 3)
-            
-        super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event):
-        # Always emit the moved signal for tracking
-        x, y = self._map_to_image(event.position())
-        self.moved.emit(float(x), float(y))
-        
-        # If we're in a custom drag, don't pass to super (prevents panning)
-        if self._custom_drag_active:
-            event.accept()
-        else:
-            super().mouseMoveEvent(event)
-
-    def mouseReleaseEvent(self, event):
-        self.released.emit()
-        self._custom_drag_active = False
-        super().mouseReleaseEvent(event)
-
+        return float(view_pos.x()), float(view_pos.y())
 
     def set_points(self, pts_xy=None, crosses_xy=None):
         if pts_xy is None or len(pts_xy) == 0:
@@ -910,17 +616,6 @@ class PGImagePanel(pg.PlotWidget):
         # Check scatter points
         pts_x, pts_y = self.points_item.getData() # arrays
         if len(pts_x) > 0:
-            # We want visual distance in screen pixels approx.
-            # But here we measure in image pixels.
-            # 15 pixels screen distance approx? 
-            # We can use mapFromViewToScene to check screen pixel dist but that's expensive for all points.
-            # Instead, assume reasonable buffer in image space depending on zoom?
-            # Actually, user interaction feels best if fixed screen tolerance.
-            
-            # Map all points to scene? No.
-            # Let's use simple image space distance. If zoomed in, tolerance in pixels is smaller physically.
-            # Wait, if I zoom in, 10 px on screen matches 0.1 px on image.
-            # So I should use mapSceneToView to get the size of 1 screen pixel.
             p0 = self.vb.mapSceneToView(pg.Point(0,0))
             p1 = self.vb.mapSceneToView(pg.Point(10,0)) # 10 screen pixels
             tol = abs(p1.x() - p0.x()) # Tolerance in image units
@@ -1118,13 +813,6 @@ class MotionProfileWidget(QWidget):
 
             # # Draw Deformation (Magenta)
             # draw_line(self.deformation_scores, QColor(255, 0, 255))
-
-            # Draw current frame cursor
-            # If score length is T-1 or T, we map current_frame to x in same domain.
-            # If we have T frames, slider goes 0..T-1.
-            # scores usually has length T-1 (diffs).
-            # We match x scale to T-1.
-            # If current_frame is T-1 (last frame), x is w.
             
             # Draw current frame cursor
             count_m = len(self.motion_scores) if self.motion_scores is not None else 0
@@ -1138,119 +826,6 @@ class MotionProfileWidget(QWidget):
         finally:
             painter.end()
 
-
-class ParameterDialog(QDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setFixedHeight(50)
-        self.motion_scores = []      # Cyan line
-        self.deformation_scores = [] # Magenta line
-        self.current_frame = 0
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-
-    def set_data(self, scores):
-        """
-        scores: list or array of correlation values (L2 norm of frame diff).
-                Length T.
-        """
-        self.motion_scores = scores
-        self.update()
-
-    def set_deformation_data(self, scores):
-        """
-        scores: list or array of avg L2 norm of deformation field.
-                Length T.
-        """
-        self.deformation_scores = scores
-        self.update()
-
-    def set_current_frame(self, frame_idx):
-        self.current_frame = frame_idx
-        self.update()
-
-    def mousePressEvent(self, event):
-        self._handle_mouse(event)
-
-    def mouseMoveEvent(self, event):
-        self._handle_mouse(event)
-
-    def _handle_mouse(self, event):
-        # Allow interaction if EITHER plot exists
-        count_m = len(self.motion_scores) if self.motion_scores is not None else 0
-        count_d = len(self.deformation_scores) if self.deformation_scores is not None else 0
-        count = max(count_m, count_d)
-
-        if count < 1:
-            return
-
-        x = event.position().x()
-        w = self.width()
-        
-        frac = max(0.0, min(1.0, x / w))
-        frame_idx = int(round(frac * (count - 1)))
-        
-        self.frame_changed.emit(frame_idx)
-
-    def paintEvent(self, event):
-        from PyQt6.QtCore import QPointF
-        from PyQt6.QtGui import QPolygonF, QPen
-        painter = QPainter(self)
-        try:
-            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-            
-            w = self.width()
-            h = self.height()
-
-            # Fill background
-            painter.fillRect(0, 0, w, h, QColor(30, 30, 30))
-
-            # Helper to draw a score array
-            def draw_line(scores, color):
-                if scores is None or len(scores) < 2:
-                    return
-                
-                count = len(scores)
-                points = []
-                for i, val in enumerate(scores):
-                    x = (i / max(1, count - 1)) * w
-                    try:
-                        v = float(val)
-                        if not np.isfinite(v): v = 0.0
-                    except: v = 0.0
-                    val_c = max(0.0, min(1.0, v))
-                    y = (1.0 - val_c) * h
-                    points.append(QPointF(x, y))
-                
-                poly = QPolygonF(points)
-                pen = QPen(color)
-                pen.setWidth(2)
-                painter.setPen(pen)
-                painter.drawPolyline(poly)
-
-            # Draw Motion (Cyan)
-            draw_line(self.motion_scores, QColor(0, 200, 255))
-
-            # # Draw Deformation (Magenta)
-            # draw_line(self.deformation_scores, QColor(255, 0, 255))
-
-            # Draw current frame cursor
-            # If score length is T-1 or T, we map current_frame to x in same domain.
-            # If we have T frames, slider goes 0..T-1.
-            # scores usually has length T-1 (diffs).
-            # We match x scale to T-1.
-            # If current_frame is T-1 (last frame), x is w.
-            
-            # Draw current frame cursor
-            count_m = len(self.motion_scores) if self.motion_scores is not None else 0
-            count_d = len(self.deformation_scores) if self.deformation_scores is not None else 0
-            count = max(count_m, count_d)
-
-            if count > 0:
-                cx = (self.current_frame / max(1, count - 1)) * w
-                painter.setPen(QPen(QColor(57, 255, 20), 1))
-                painter.drawLine(int(cx), 0, int(cx), h)
-        finally:
-            painter.end()
 
 
 class ParameterDialog(QDialog):
@@ -1288,7 +863,7 @@ class MotionCorrectionGUI(QMainWindow):
         self.move(g.left() + (g.width() - w)//2, g.top() + (g.height() - h)//2)
 
         self.setAcceptDrops(True)
-
+        self._tracks_user_edited = False
         self.video_path = None
         self.video_data = None
 
@@ -1542,7 +1117,7 @@ class MotionCorrectionGUI(QMainWindow):
     def _update_points_label(self):
         n_base = int(self.base_grid_active.sum()) if self.base_grid_active is not None else 0
         n_custom = len(self.custom_grid_pts) if self.custom_grid_pts else 0
-        self.points_label.setText(f"Points: {n_base + n_custom} (base {n_base} + custom {n_custom})")
+        self.points_label.setText(f"Points: {n_base + n_custom} ") #(base {n_base} + custom {n_custom})
 
     def _set_input_image(self, frame):
         self.update_plot()
@@ -1594,9 +1169,9 @@ class MotionCorrectionGUI(QMainWindow):
         self.edit_tracks_btn.setEnabled(False)  # enabled only when tracks exist
         top_bar.addWidget(self.edit_tracks_btn)
 
-        self.apply_all_tracks_chk = QCheckBox("Apply to all")
-        self.apply_all_tracks_chk.setEnabled(False)
-        top_bar.addWidget(self.apply_all_tracks_chk)
+        # self.apply_all_tracks_chk = QCheckBox("Apply to all")
+        # self.apply_all_tracks_chk.setEnabled(False)
+        # top_bar.addWidget(self.apply_all_tracks_chk)
 
         # 4. Preset
         top_bar.addWidget(QLabel("Preset:"))
@@ -1616,9 +1191,6 @@ class MotionCorrectionGUI(QMainWindow):
         self.settings_btn = QPushButton("⚙️ Parameters")
         self.settings_btn.clicked.connect(self.open_parameter_dialog)
         top_bar.addWidget(self.settings_btn)
-
-
-
 
         # 6. Run Registration
         self.process_btn = QPushButton("Registration")
@@ -1659,7 +1231,6 @@ class MotionCorrectionGUI(QMainWindow):
         self.auto_conf_chk.stateChanged.connect(lambda *_: self._apply_confidence_filter())
 
 
-
         # --- Parameter Widgets (Detailed) ---
         # These are created here but added to the ParameterDialog instead of main window
         self.num_points_spin = QSpinBox()
@@ -1682,8 +1253,8 @@ class MotionCorrectionGUI(QMainWindow):
         self.grid_cols_ctrl.setValue(int(getattr(self, "grid_cols", 4)))
         self.grid_cols_ctrl.valueChanged.connect(self.on_preset_params_changed)
 
-        self.apply_preset_btn = QPushButton("Apply to Grid")
-        self.apply_preset_btn.clicked.connect(self.apply_point_preset)
+        # self.apply_preset_btn = QPushButton("Apply to Grid")
+        # self.apply_preset_btn.clicked.connect(self.apply_point_preset)
 
         self.df_sigma_spin = QSpinBox()
         self.df_sigma_spin.setRange(0, 20)
@@ -1741,20 +1312,20 @@ class MotionCorrectionGUI(QMainWindow):
         pd_layout.addWidget(self.lbl_minDist)
         pd_layout.addWidget(self.min_dist_spin)
         
-        pd_layout.addWidget(self.apply_preset_btn)
+        # pd_layout.addWidget(self.apply_preset_btn)
         
-        pd_layout.addWidget(QLabel("---"))
-        pd_layout.addWidget(QLabel("Expand Preset:"))
-        pd_layout.addWidget(self.expand_mode_combo)
-        pd_layout.addWidget(self.expand_preset_btn)
-        pd_layout.addWidget(self.rigid_motion_chk)
+        # pd_layout.addWidget(QLabel("---"))
+        # pd_layout.addWidget(QLabel("Expand Preset:"))
+        # pd_layout.addWidget(self.expand_mode_combo)
+        # pd_layout.addWidget(self.expand_preset_btn)
+        # pd_layout.addWidget(self.rigid_motion_chk)
         
-        pd_layout.addWidget(QLabel("---"))
+        # pd_layout.addWidget(QLabel("---"))
         
-        pd_layout.addWidget(self.lbl_sigma)
-        pd_layout.addWidget(self.df_sigma_spin)
+        # pd_layout.addWidget(self.lbl_sigma)
+        # pd_layout.addWidget(self.df_sigma_spin)
         
-        pd_layout.addWidget(QLabel("---"))
+        # pd_layout.addWidget(QLabel("---"))
         
         self.rotate_btn = QPushButton("Rotate Input 90°")
         self.rotate_btn.clicked.connect(self.rotate_input)
@@ -1763,15 +1334,15 @@ class MotionCorrectionGUI(QMainWindow):
         pd_layout.addWidget(self.reset_zoom_btn)
         pd_layout.addWidget(self.rotate_btn)
         pd_layout.addWidget(self.clear_points_btn)
-        pd_layout.addWidget(self.undo_btn)
+        #pd_layout.addWidget(self.undo_btn)
 
         # Move close button to bottom
         pd_layout.removeWidget(self.param_dialog.close_btn)
         pd_layout.addWidget(self.param_dialog.close_btn)
 
-        pd_layout.addWidget(QLabel("Confidence threshold (visibility):"))
-        pd_layout.addWidget(self.conf_thresh_spin)
-        pd_layout.addWidget(self.auto_conf_chk)
+        # pd_layout.addWidget(QLabel("Confidence threshold (visibility):"))
+        # pd_layout.addWidget(self.conf_thresh_spin)
+        # pd_layout.addWidget(self.auto_conf_chk)
 
         
         self.points_label = QLabel("Points: 0")
@@ -1792,13 +1363,13 @@ class MotionCorrectionGUI(QMainWindow):
 
         # Left selector
         self.view_left_combo = QComboBox()
-        self.view_left_combo.addItems(["Input", "Tracked Points", "Corrected", "Deformation Field", "Corrected (ANTs)", "Corrected (LDDMM)"])
+        self.view_left_combo.addItems(["Input", "Tracked Points", "Corrected", "Deformation Field"]) #, "Corrected (ANTs)", "Corrected (LDDMM)"
         self.view_left_combo.setCurrentText("Tracked Points")
         self.view_left_combo.currentTextChanged.connect(lambda *_: self.update_plot())
 
         # Right selector
         self.view_right_combo = QComboBox()
-        self.view_right_combo.addItems(["Input", "Tracked Points", "Corrected", "Deformation Field", "Corrected (ANTs)", "Corrected (LDDMM)"])
+        self.view_right_combo.addItems(["Input", "Tracked Points", "Corrected", "Deformation Field"]) #, "Corrected (ANTs)", "Corrected (LDDMM)"
         self.view_right_combo.setCurrentText("Corrected")
         self.view_right_combo.currentTextChanged.connect(lambda *_: self.update_plot())
 
@@ -1809,8 +1380,8 @@ class MotionCorrectionGUI(QMainWindow):
         self.view_right._parent_gui = self
 
         # Place selectors above each panel
-        viewer_layout.addWidget(QLabel("Left view:"), 0, 0)
-        viewer_layout.addWidget(QLabel("Right view:"), 0, 1)
+        # viewer_layout.addWidget(QLabel("Left view:"), 0, 0)
+        # viewer_layout.addWidget(QLabel("Right view:"), 0, 1)
         viewer_layout.addWidget(self.view_left_combo, 1, 0)
         viewer_layout.addWidget(self.view_right_combo, 1, 1)
         viewer_layout.addWidget(self.view_left, 2, 0)
@@ -1946,6 +1517,24 @@ class MotionCorrectionGUI(QMainWindow):
         self.status_label.setText("UI loaded. Click 'Load File' or drag & drop a file.")
 
 
+    def _range_str(self, a, name=""):
+        if a is None:
+            return f"{name}: None"
+        x = np.asarray(a)
+        finite = np.isfinite(x)
+        if not finite.any():
+            return f"{name}: no finite values"
+        mn = float(np.min(x[finite]))
+        mx = float(np.max(x[finite]))
+        return f"{name}: dtype={x.dtype}, min={mn:.3f}, max={mx:.3f}"
+
+    def _get_minmax(self, a):
+        x = np.asarray(a)
+        finite = np.isfinite(x)
+        if not finite.any():
+            return None, None
+        return float(np.min(x[finite])), float(np.max(x[finite]))
+
     def on_sync_view_toggled(self, state):
         master_vb = self.view_left.getViewBox()
         vb_r = self.view_right.getViewBox()
@@ -1999,8 +1588,8 @@ class MotionCorrectionGUI(QMainWindow):
         self._set_visible([self.lbl_N, self.num_points_spin], show_n)
         self._set_visible([self.lbl_minDist, self.min_dist_spin], show_mindist)
 
-        self.apply_preset_btn.setVisible(True)
-        self.apply_preset_btn.setEnabled(True)
+        # self.apply_preset_btn.setVisible(True)
+        # self.apply_preset_btn.setEnabled(True)
 
     def on_preset_changed(self, *_):
         self._update_preset_controls()
@@ -2055,7 +1644,9 @@ class MotionCorrectionGUI(QMainWindow):
 
     def on_preset_params_changed(self):
         if self.video_data is not None:
-            self.apply_point_preset()
+            # re-apply current preset in-place (replace) ONLY if the preset is grid/features/etc.
+            # and only when user expects it.
+            self.apply_point_preset(mode="replace")
 
     # ---------- presets ----------
     def _get_gray_video_np(self):
@@ -2078,7 +1669,7 @@ class MotionCorrectionGUI(QMainWindow):
         ref_u8 = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(ref_u8)
         return ref_u8
 
-    def _clip_border(self, pts, H, W, border=10):
+    def _clip_border(self, pts, H, W, border=0):
         if pts is None or len(pts) == 0:
             return np.zeros((0, 2), dtype=np.float32)
         pts = np.asarray(pts, dtype=np.float32)
@@ -2102,7 +1693,7 @@ class MotionCorrectionGUI(QMainWindow):
         if pts is None:
             return np.zeros((0, 2), dtype=np.float32)
         pts = pts.reshape(-1, 2).astype(np.float32)
-        return self._clip_border(pts, H, W, border=10)
+        return self._clip_border(pts, H, W, border=0)
 
     def _preset_activity(self, gray_video, num_points=200, min_dist=15):
         H, W = gray_video.shape[1], gray_video.shape[2]
@@ -2130,7 +1721,7 @@ class MotionCorrectionGUI(QMainWindow):
         if pts is None:
             return np.zeros((0, 2), dtype=np.float32)
         pts = pts.reshape(-1, 2).astype(np.float32)
-        return self._clip_border(pts, H, W, border=10)
+        return self._clip_border(pts, H, W, border=0)
 
     def _preset_segmentation_centroids(self, ref_u8_filt, num_points=200):
         H, W = ref_u8_filt.shape[:2]
@@ -2147,12 +1738,12 @@ class MotionCorrectionGUI(QMainWindow):
 
         order = np.argsort(-areas)
         cent = cent[order][:int(num_points)]
-        cent = self._clip_border(cent, H, W, border=10)
+        cent = self._clip_border(cent, H, W, border=0)
         return cent
 
     def _preset_regular_grid(self, H, W, rows, cols):
-        xs = np.linspace(-10, W + 10, cols, dtype=np.float32) #0, H-1
-        ys = np.linspace(-10, H + 10, rows, dtype=np.float32) #10, H - 10
+        xs = np.linspace(5, W -5, cols, dtype=np.float32) #0, H-1
+        ys = np.linspace(5, H -5, rows, dtype=np.float32) #10, H - 10
         gx, gy = np.meshgrid(xs, ys)
         return np.stack([gx.reshape(-1), gy.reshape(-1)], axis=-1)
 
@@ -2189,7 +1780,7 @@ class MotionCorrectionGUI(QMainWindow):
             self._update_points_label()
             self.update_grid_display_pre_registration()
             self.status_label.setText("Preset applied: None (no points)")
-            self.process_btn.setEnabled(False)
+            self.process_btn.setEnabled(True)
             self.update_plot()
             return
 
@@ -2226,6 +1817,46 @@ class MotionCorrectionGUI(QMainWindow):
                 pts_new = self._preset_segmentation_centroids(ref_u8_filt, num_points=num_points)
 
         pts_new = np.asarray(pts_new, dtype=np.float32).reshape(-1, 2)
+
+        # ---- APPLY pts_new to internal state ----
+        if mode == "replace":
+            self.base_grid_pts = pts_new.astype(np.float32)
+            self.base_grid_active = np.ones((len(self.base_grid_pts),), dtype=bool)
+            self.base_grid_pts0 = self.base_grid_pts.copy()
+
+        elif mode == "add":
+            # add as base points, keep existing
+            if self.base_grid_pts is None:
+                self.base_grid_pts = np.zeros((0, 2), dtype=np.float32)
+            old = np.asarray(self.base_grid_pts, dtype=np.float32).reshape(-1, 2)
+
+            # optional: remove near-duplicates vs existing points
+            pts_new_f = self._filter_new_points(pts_new, min_dist=min_dist)
+
+            self.base_grid_pts = np.vstack([old, pts_new_f]).astype(np.float32)
+
+            if self.base_grid_active is None:
+                self.base_grid_active = np.ones((len(old),), dtype=bool)
+            # newly added are active
+            self.base_grid_active = np.concatenate(
+                [self.base_grid_active.astype(bool), np.ones((len(pts_new_f),), dtype=bool)]
+            )
+
+            if self.base_grid_pts0 is None:
+                self.base_grid_pts0 = old.copy()
+
+        # keep tracked flags aligned with base points length
+        if self.base_grid_tracked is None or len(self.base_grid_tracked) != len(self.base_grid_pts):
+            self.base_grid_tracked = np.zeros((len(self.base_grid_pts),), dtype=bool)
+
+        # enable registration if we have any points
+        self.process_btn.setEnabled(len(self.base_grid_pts) > 0 or len(self.custom_grid_pts) > 0)
+
+        self._update_points_label()
+        self.update_grid_display_pre_registration()
+        self.update_plot()
+        self.status_label.setText(f"Preset applied: {preset} ({mode})")
+
 
         # after base_grid_pts/base_grid_active updated:
         if mode == "replace":
@@ -2589,7 +2220,7 @@ class MotionCorrectionGUI(QMainWindow):
         half[:, 1] = np.clip(half[:, 1] + 0.5 * dy, 0, H - 1)
 
         out = np.vstack([shifted, half]).astype(np.float32)
-        return self._clip_border(out, H, W, border=10)
+        return self._clip_border(out, H, W, border=0)
 
     def expand_preset_after_motion(self):
         if self.video_data is None:
@@ -2632,7 +2263,7 @@ class MotionCorrectionGUI(QMainWindow):
                 )
                 if p is not None:
                     new_pts = p.reshape(-1,2).astype(np.float32)
-                    new_pts = self._clip_border(new_pts, H, W, border=10)
+                    new_pts = self._clip_border(new_pts, H, W, border=0)
 
             elif "algo" in mode:
                 mag_u8 = self._flow_magnitude_map(gray, downscale_to=128)
@@ -2651,7 +2282,7 @@ class MotionCorrectionGUI(QMainWindow):
                 )
                 if p is not None:
                     new_pts = p.reshape(-1,2).astype(np.float32)
-                    new_pts = self._clip_border(new_pts, H, W, border=10)
+                    new_pts = self._clip_border(new_pts, H, W, border=0)
 
             else:
                 self.status_label.setText("Heuristic or Algorithm required for expand.")
@@ -3082,6 +2713,7 @@ class MotionCorrectionGUI(QMainWindow):
                 current_pts = tracks[self.current_frame]
                 tidx, tdist = self._nearest_point(current_pts, x_f, y_f)
                 if tdist < tol:
+                    self._tracks_user_edited = True
                     self.selected_track_idx = tidx
                     if self.track_active is not None and len(self.track_active) == current_pts.shape[0]:
                         self.track_active[tidx] = ~self.track_active[tidx]
@@ -3227,6 +2859,7 @@ class MotionCorrectionGUI(QMainWindow):
         kind, idx = self._drag
         
         if kind == "track":
+            self._tracks_user_edited = True
             if not self.edit_tracks_mode:
                 return
             if self.pred_tracks is not None:
@@ -3363,6 +2996,13 @@ class MotionCorrectionGUI(QMainWindow):
     def _render_view(self, panel, which, idx, filtered_frame, levels=None):
         which = (which or "").strip()
 
+        def clear_overlays():
+            panel.points_item.setData([], [])
+            panel.cross_item.setData([], [])
+            if hasattr(panel, "pending_item"):
+                panel.pending_item.setData([], [])
+            panel.set_trajectories(None, 0)
+
         # ---------- helpers ----------
         def draw_points_preview():
             ptsA = None
@@ -3380,6 +3020,7 @@ class MotionCorrectionGUI(QMainWindow):
         # ---------- INPUT ----------
         if which == "Input":
             panel.set_image(filtered_frame, auto_range=False, levels=levels)
+            clear_overlays()
             return
 
         # ---------- TRACKED POINTS (ONLY place to draw tracks) ----------
@@ -3403,28 +3044,35 @@ class MotionCorrectionGUI(QMainWindow):
             N = ptsA.shape[0]
             vis = self._get_visibility_frame(idx, N)
 
-            mask = np.ones((N,), dtype=bool)
+            # mask = np.ones((N,), dtype=bool)
 
-            if self.track_active is not None and len(self.track_active) == N:
-                mask &= self.track_active
+            # if self.track_active is not None and len(self.track_active) == N:
+            #     mask &= self.track_active
 
-            vthr = float(self.conf_thresh_spin.value()) if hasattr(self, "conf_thresh_spin") else 0.0
-            if vis is not None:
-                mask &= (vis >= vthr)
+            # vthr = float(self.conf_thresh_spin.value()) if hasattr(self, "conf_thresh_spin") else 0.0
+            # if vis is not None:
+            #     mask &= (vis >= vthr)
 
-            pts_show = ptsA[mask]
+            pts_show = ptsA#[mask]
 
             # optional coloring by visibility
             colors = None
-            if vis is not None:
-                v_show = vis[mask]
-                a = np.clip(v_show * 255.0, 30, 255).astype(np.uint8)
-                g = np.clip(v_show * 255.0, 0, 255).astype(np.uint8)
-                r = np.zeros_like(a, dtype=np.uint8)
-                b = np.zeros_like(a, dtype=np.uint8)
-                colors = np.stack([r, g, b, a], axis=1)
+            # if vis is not None:
+            #     v_show = vis
+            #     g = (50 + 205 * v_show).astype(np.uint8)      # never too dark
+            #     a = np.full_like(g, 255, dtype=np.uint8)      # always opaque
+            #     r = np.zeros_like(g, dtype=np.uint8)
+            #     b = np.zeros_like(g, dtype=np.uint8)
+            #     colors = np.stack([r, g, b, a], axis=1)
+            # panel.set_points_colored(pts_show, colors_rgba=colors, size=8)
 
+            N = pts_show.shape[0]
+            colors = np.tile(np.array([[0, 255, 0, 255]], dtype=np.uint8), (N, 1))
             panel.set_points_colored(pts_show, colors_rgba=colors, size=8)
+
+            
+            # ensure view includes outside points too (use full ptsA, not just pts_show)
+            panel.fit_view_to_image_and_points(ptsA, margin=20)
 
             # draw trajectories ONLY here
             panel.set_trajectories(tr, idx, trail=15)
@@ -3467,6 +3115,7 @@ class MotionCorrectionGUI(QMainWindow):
                 panel.set_image(wf, auto_range=False, levels=self._calc_levels(wf))
             else:
                 panel.set_image(None)
+            clear_overlays()
 
             return
 
@@ -3478,7 +3127,7 @@ class MotionCorrectionGUI(QMainWindow):
                 panel.set_image(disp_preview, auto_range=False, levels=self._calc_levels(disp_preview))
             else:
                 panel.set_image(None)
-
+            clear_overlays()
 
             return
 
@@ -3488,7 +3137,7 @@ class MotionCorrectionGUI(QMainWindow):
                 panel.set_image(self.ants_video[idx], auto_range=False, levels=self._calc_levels(self.ants_video[idx]))
             else:
                 panel.set_image(None)
-
+            clear_overlays()
             return
 
         # ---------- Corrected (LDDMM) ----------
@@ -3497,12 +3146,20 @@ class MotionCorrectionGUI(QMainWindow):
                 panel.set_image(self.lddmm_video[idx], auto_range=False, levels=self._calc_levels(self.lddmm_video[idx]))
             else:
                 panel.set_image(None)
-
+            clear_overlays()
             return
 
         # fallback
         panel.set_image(filtered_frame, auto_range=False, levels=levels)
         panel.set_points(pts_xy=None, crosses_xy=None)
+        all_pts = []
+        if ptsA is not None and len(ptsA) > 0:
+            all_pts.append(np.asarray(ptsA, dtype=np.float32))
+        # if crosses is not None and len(crosses) > 0:
+        #     all_pts.append(np.asarray(crosses, dtype=np.float32))
+        P = np.vstack(all_pts) if all_pts else None
+
+        panel.fit_view_to_image_and_points(P, margin=20)
         panel.set_trajectories(None, 0)
         panel.points_item.setData([], [])
         panel.cross_item.setData([], [])
@@ -3813,10 +3470,10 @@ class MotionCorrectionGUI(QMainWindow):
                 self.selected_track_idx -= 1
 
         # --- refresh ---
-        try:
-            self._apply_confidence_filter()
-        except Exception:
-            self.update_plot()
+        # try:
+        #     self._apply_confidence_filter()
+        # except Exception:
+        #     self.update_plot()
 
 
 
@@ -3886,6 +3543,7 @@ class MotionCorrectionGUI(QMainWindow):
 
         self.update_plot()
         self.edit_tracks_btn.setEnabled(True)
+        self._tracks_user_edited = False
     
     def _apply_confidence_filter(self):
         if self.pred_tracks is None:
@@ -3935,7 +3593,8 @@ class MotionCorrectionGUI(QMainWindow):
         self.update_plot()
 
         # optional: update warping immediately
-        self._schedule_recalc_warping(delay_ms=0)
+        if self._tracks_user_edited:
+            self._schedule_recalc_warping(delay_ms=0)
 
     def _to_thwc(self, vid):
         v = np.asarray(vid)
@@ -4168,6 +3827,32 @@ class MotionCorrectionGUI(QMainWindow):
         # 6) Warped video + DF
         # ---------------------------------------
         self.warped_video = self._to_thwc(warped_video) if warped_video is not None else None
+        
+        # ---- RANGE CHECK: input vs corrected ----
+        inp = self.viz_data.get("input", None)  # THWC float32
+        if inp is not None and self.warped_video is not None:
+            in_mn, in_mx = self._get_minmax(inp)
+            w_mn, w_mx   = self._get_minmax(self.warped_video)
+
+            msg = " | ".join([
+                self._range_str(inp, "INPUT"),
+                self._range_str(self.warped_video, "WARPED"),
+            ])
+
+            # If you want a strict "same range" check:
+            same_range = (in_mn is not None and w_mn is not None and
+                        abs(in_mn - w_mn) < 1e-3 and abs(in_mx - w_mx) < 1e-3)
+
+            # OPTIONAL: enforce the same range by clamping warped to input min/max
+            # (this keeps original scale but prevents overshoot)
+            if in_mn is not None and in_mx is not None:
+                #self.warped_video = np.clip(self.warped_video, in_mn, in_mx).astype(self.warped_video.dtype)
+                self.warped_video = np.clip(self.warped_video, 0, 255).astype(np.uint8)
+                self.viz_data["warped"] = self.warped_video
+
+            self.status_label.setText(msg + (" | SAME" if same_range else " | DIFFERENT"))
+
+
         if self.warped_video is not None:
             self.viz_data["warped"] = self.warped_video
 
@@ -4182,8 +3867,9 @@ class MotionCorrectionGUI(QMainWindow):
         # ---------------------------------------
         try:
             if self.warped_video is not None:
-                self.ssim_score = video_ssim_score(self.warped_video, mode="consecutive")
-                self.status_label.setText(f"Warping updated | SSIM={self.ssim_score:.4f}")
+                self.ssim_score = video_ssim_score(self.warped_video, mode="ref_first")
+                # self.status_label.setText(f"Warping updated | SSIM={self.ssim_score:.4f}")
+                self.status_label.setText(f"Done")
             else:
                 self.status_label.setText("Warping updated")
         except Exception as e:
@@ -4238,6 +3924,9 @@ class MotionCorrectionGUI(QMainWindow):
             self._pending_recalc = False
             remaining = max(0, getattr(self, "_target_recalc_time_ms", 0) - self._edit_clock.elapsed())
             self._schedule_recalc_warping(delay_ms=remaining)
+
+        self._tracks_user_edited = False
+
 
 
     def on_processing_error(self, error_msg):

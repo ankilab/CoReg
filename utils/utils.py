@@ -279,60 +279,64 @@ def _to_gray_u8_frame(frame):
     return np.clip(a, 0, 255).astype(np.uint8)
 
 
-def ssim2d_u8(img1_u8, img2_u8, sigma=1.5):
-    x = img1_u8.astype(np.float32)
-    y = img2_u8.astype(np.float32)
+# def ssim2d_u8(img1_u8, img2_u8, sigma=1.5):
+#     x = img1_u8.astype(np.float32)
+#     y = img2_u8.astype(np.float32)
 
-    C1 = (0.01 * 255) ** 2
-    C2 = (0.03 * 255) ** 2
+#     C1 = (0.01 * 255) ** 2
+#     C2 = (0.03 * 255) ** 2
 
-    mu_x = cv2.GaussianBlur(x, (0, 0), sigma)
-    mu_y = cv2.GaussianBlur(y, (0, 0), sigma)
+#     mu_x = cv2.GaussianBlur(x, (0, 0), sigma)
+#     mu_y = cv2.GaussianBlur(y, (0, 0), sigma)
 
-    mu_x2 = mu_x * mu_x
-    mu_y2 = mu_y * mu_y
-    mu_xy = mu_x * mu_y
+#     mu_x2 = mu_x * mu_x
+#     mu_y2 = mu_y * mu_y
+#     mu_xy = mu_x * mu_y
 
-    sig_x2 = cv2.GaussianBlur(x * x, (0, 0), sigma) - mu_x2
-    sig_y2 = cv2.GaussianBlur(y * y, (0, 0), sigma) - mu_y2
-    sig_xy = cv2.GaussianBlur(x * y, (0, 0), sigma) - mu_xy
+#     sig_x2 = cv2.GaussianBlur(x * x, (0, 0), sigma) - mu_x2
+#     sig_y2 = cv2.GaussianBlur(y * y, (0, 0), sigma) - mu_y2
+#     sig_xy = cv2.GaussianBlur(x * y, (0, 0), sigma) - mu_xy
 
-    num = (2 * mu_xy + C1) * (2 * sig_xy + C2)
-    den = (mu_x2 + mu_y2 + C1) * (sig_x2 + sig_y2 + C2)
-    ssim_map = num / (den + 1e-12)
-    return float(np.mean(ssim_map)), ssim_map
+#     num = (2 * mu_xy + C1) * (2 * sig_xy + C2)
+#     den = (mu_x2 + mu_y2 + C1) * (sig_x2 + sig_y2 + C2)
+#     ssim_map = num / (den + 1e-12)
+#     return float(np.mean(ssim_map)), ssim_map
 
 
-def video_ssim_score(video, mode="consecutive"):
-    """
-    video: (T,H,W) or (T,H,W,C) or torch (T,C,H,W)
-    mode: "consecutive" or "ref_first"
-    """
+def video_ssim_score(video, mode="ref_first"):
     v = video
     if isinstance(v, torch.Tensor):
         v = v.detach().cpu().numpy()
     v = np.asarray(v)
 
-    # Normalize into a list of gray uint8 frames
-    if v.ndim == 4 and v.shape[1] in (1,3):  # (T,C,H,W)
-        frames = [ _to_gray_u8_frame(v[t]) for t in range(v.shape[0]) ]
-    elif v.ndim == 4 and v.shape[-1] in (3,4):  # (T,H,W,C)
-        frames = [ _to_gray_u8_frame(v[t]) for t in range(v.shape[0]) ]
-    elif v.ndim == 3:  # (T,H,W)
-        frames = [ _to_gray_u8_frame(v[t]) for t in range(v.shape[0]) ]
+    # Convert to grayscale float32 frames WITHOUT per-frame normalization
+    if v.ndim == 4 and v.shape[1] in (1, 3):       # (T,C,H,W)
+        gray = v[:, 0].astype(np.float32) if v.shape[1] == 1 else v[:, 0].astype(np.float32)  # or proper RGB->gray if needed
+    elif v.ndim == 4 and v.shape[-1] in (3, 4):    # (T,H,W,C)
+        gray = v[..., 0].astype(np.float32)        # or proper RGB->gray
+    elif v.ndim == 3:                               # (T,H,W)
+        gray = v.astype(np.float32)
     else:
         raise ValueError(f"Unsupported video shape for SSIM: {v.shape}")
 
-    T = len(frames)
+    T = gray.shape[0]
     if T < 2:
         return 0.0
 
+    # Global scaling (same for all frames)
+    finite = np.isfinite(gray)
+    lo = float(np.percentile(gray[finite], 1)) if finite.any() else 0.0
+    hi = float(np.percentile(gray[finite], 99)) if finite.any() else 1.0
+    if hi <= lo:
+        hi = lo + 1.0
+
+    frames_u8 = np.clip((gray - lo) / (hi - lo) * 255.0, 0, 255).astype(np.uint8)
+
     if mode == "ref_first":
-        ref = frames[0]
-        return float(np.mean([ssim2d_u8(frames[t], ref)[0] for t in range(T)]))
+        ref = frames_u8[0]
+        scores = [(frames_u8[t]- ref) for t in range(1, T)]
+        return float(np.mean(scores)) if scores else 0.0
 
     # consecutive
-    scores = []
-    for t in range(1, T):
-        scores.append(ssim2d_u8(frames[t], frames[t-1])[0])
-    return float(np.mean(scores))
+    scores = [(frames_u8[t] - frames_u8[t - 1]) for t in range(1, T)]
+    return float(np.mean(scores)) if scores else 0.0
