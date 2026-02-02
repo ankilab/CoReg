@@ -8,6 +8,7 @@ import tifffile
 import h5py
 from pathlib import Path
 import hdf5plugin
+import imageio.v3 as io
 
 
 def _ensure_3ch_uint8(video_np):
@@ -84,7 +85,8 @@ def load_hdf5(h5_path, dataset_path, frames: int = None, resize=True, size=(256,
     return _to_torch_TCHW(v_thwc)
 
 def load_tiff(path, frames: int = None, resize: bool = True, size=(256, 256)):
-    mm = tifffile.memmap(path)
+    # mm = tifffile.memmap(path)
+    mm = io.imread(path)
 
     if mm.ndim == 3:
         T = min(int(frames), mm.shape[0]) if frames is not None else mm.shape[0]

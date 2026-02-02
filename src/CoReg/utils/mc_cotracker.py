@@ -20,7 +20,7 @@ torch.cuda.empty_cache()
 gc.collect()
 
 DEFAULT_DEVICE = (
-    "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+    "cpu" #"cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 )
 
 def load_video(file, resize=True):
@@ -64,7 +64,7 @@ def cotrack_model(video, queries, grid_size=0):
     import os
     os.environ["TORCH_HOME"] = "/data/users/va11moje/cache/cotracker"
 
-    model = torch.hub.load("facebookresearch/co-tracker", "cotracker3_offline").to("cuda")
+    model = torch.hub.load("facebookresearch/co-tracker", "cotracker3_offline")
     model = model.to(DEFAULT_DEVICE)
     video = video.to(DEFAULT_DEVICE)
     model.model.model_resolution = video.shape[2:]

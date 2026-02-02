@@ -24,7 +24,7 @@ except ImportError:
 # Add current directory to path to allow imports
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 import utils.mc_cotracker as mc_cotracker
-mc_cotracker.DEFAULT_DEVICE = 'cuda'
+mc_cotracker.DEFAULT_DEVICE = 'cpu'
 from utils.mc_cotracker import cotrack_model, warping
 from utils.utils import load_video, load_tiff, load_hdf5
 pg.setConfigOptions(imageAxisOrder='row-major')  # damit (H,W) wie numpy angezeigt wird
@@ -2395,8 +2395,8 @@ class MotionCorrectionGUI(QMainWindow):
             if ext in ['.avi', '.mp4']:
                 self.video_data = load_video(self.video_path, resize=False, max_frames=30)
             elif ext in ['.tiff', '.tif']:
-                video_np = load_tiff(self.video_path, frames=30) # Load all (up to sensible limit) or modify util
-                self.video_data = torch.from_numpy(video_np).unsqueeze(1).repeat(1, 3, 1, 1).float()
+                video_np = load_tiff(self.video_path, resize=False) # Load all (up to sensible limit) or modify util
+                self.video_data = video_np
             elif ext in ['.h5', '.hdf5']:
                 video_np = load_hdf5(self.video_path, "/data", frames=30)
                 self.video_data = torch.from_numpy(video_np).unsqueeze(1).repeat(1, 3, 1, 1).float()
