@@ -85,8 +85,7 @@ def load_hdf5(h5_path, dataset_path, frames: int = None, resize=True, size=(256,
     return _to_torch_TCHW(v_thwc)
 
 def load_tiff(path, frames: int = None, resize: bool = True, size=(256, 256)):
-    # mm = tifffile.memmap(path)
-    mm = io.imread(path)
+    mm = tifffile.memmap(path)
 
     if mm.ndim == 3:
         T = min(int(frames), mm.shape[0]) if frames is not None else mm.shape[0]
@@ -108,6 +107,7 @@ def load_tiff(path, frames: int = None, resize: bool = True, size=(256, 256)):
     # optional resize
     v_thwc = _maybe_resize_video_THWC(v_thwc, resize=resize, size=size)
 
+    # Returns already the correct shape...
     return _to_torch_TCHW(v_thwc)
 
 def load_video(file: str, resize: bool = True, size=(256, 256), max_frames: int = None):

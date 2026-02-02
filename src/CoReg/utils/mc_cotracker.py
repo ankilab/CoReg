@@ -19,6 +19,7 @@ import gc
 torch.cuda.empty_cache()
 gc.collect()
 
+# Currently my hack for ensuring it is CPU only
 DEFAULT_DEVICE = (
     "cpu" #"cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 )
@@ -45,7 +46,7 @@ def load_video(file, resize=True):
     video = torch.from_numpy(video).permute(0, 3, 1, 2).float()
     #video = F.interpolate(video, size=size, mode='bilinear', align_corners=False)[None]
 
-    return video[:10]
+    return video[:10] ##<-- for testing, use only first 10 frames?! why is this hard coded
 
 def cotrack_model(video, queries, grid_size=0):
     """"Run the CoTracker model on the provided video and grid points.
