@@ -14,7 +14,7 @@ Motion-correction and image registration toolkit, which is CoTracker based track
 
 ## Installation
 
-Clone the repository. Use a fresh virtual environment. Install PyTorch per your platform/CUDA, then common packages. Example on Windows (cmd):
+Clone the repository. Use a fresh virtual environment. Install python >= 3.10, PyTorch per your platform/CUDA, then common packages. Example on Windows (cmd):
 
 ```cmd
 git clone https://github.com/neuluna/registration_gui

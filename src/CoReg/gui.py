@@ -331,6 +331,7 @@ class PGImagePanel(pg.PlotWidget):
     pressed  = pyqtSignal(float, float, int)   # x,y,button (1/2/3)
     moved    = pyqtSignal(float, float)
     released = pyqtSignal()
+    clicked_outside_image = pyqtSignal()     
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -404,10 +405,6 @@ class PGImagePanel(pg.PlotWidget):
         self.pending_item.setZValue(11)
         self.cross_item.setZValue(12)
 
-
-        self.scene().sigMouseMoved.disconnect(self._on_mouse_moved) if hasattr(self, '_on_mouse_moved') else None
-        self.scene().sigMouseClicked.disconnect(self._on_mouse_clicked) if hasattr(self, '_on_mouse_clicked') else None
-        
         self.last_mouse_pos = None
         self._possible_click = False
 
@@ -443,6 +440,7 @@ class PGImagePanel(pg.PlotWidget):
         return r, g, b
 
     def set_image(self, img_np, auto_range=True, levels=None):
+        self._current_img = img_np
         if img_np is None:
             self.img_item.clear()
             self.points_item.setData([], [])
@@ -634,31 +632,59 @@ class PGImagePanel(pg.PlotWidget):
         return False
 
     def mousePressEvent(self, ev):
-        if ev.button() == Qt.MouseButton.LeftButton:
-            # Check if over a point - if so, capture event for Editing (Dragging)
+        btn_int = self._qt_btn_to_int(ev.button())
+
+        # Map to image coords (x,y in image space)
+        pos_xy = self._map_scene_to_image(ev.position())
+        if pos_xy is None:
+            super().mousePressEvent(ev)
+            return
+
+        x, y = pos_xy
+
+        # If no image is displayed -> outside
+        img = getattr(self, "_current_img", None)
+        if img is None:
+            self.clicked_outside_image.emit()
+            ev.accept()
+            return
+
+        a = np.asarray(img)
+        H, W = (a.shape[0], a.shape[1])  # works for 2D or (H,W,C)
+
+        # Outside image rect?
+        if (x < 0) or (y < 0) or (x >= W) or (y >= H):
+            self.clicked_outside_image.emit()
+            ev.accept()
+            return
+
+        # ---- INSIDE IMAGE: normal behavior ----
+        if btn_int == 1:
+            # left click: if over point -> start drag/edit, else maybe add point on release
             if self._is_over_point(ev.position()):
-                pos = self._map_scene_to_image(ev.position())
-                if pos:
-                    x, y = pos
-                    self.pressed.emit(x, y, 1)
-                    ev.accept()
-                    return # Don't pass to super (no Pan)
+                self._possible_click = False
+                self.last_mouse_pos = None
+                self.pressed.emit(float(x), float(y), 1)
+                ev.accept()
+                return
             else:
-                # Not over point: prepare for possible Add Point (on release) or Pan (on drag)
                 self._possible_click = True
                 self.last_mouse_pos = ev.position()
-        
-        elif ev.button() == Qt.MouseButton.RightButton:
-             # Right click logic (delete etc)
-             # Emit pressed immediately
-             pos = self._map_scene_to_image(ev.position())
-             if pos:
-                x, y = pos
-                self.pressed.emit(x, y, 3)
+                # don't emit pressed here; you do it on release if it stays a click
                 ev.accept()
                 return
 
-        super().mousePressEvent(ev) # Standard Pan/Zoom
+        if btn_int == 3:
+            # right click: delete/toggle etc -> emit immediately
+            self._possible_click = False
+            self.last_mouse_pos = None
+            self.pressed.emit(float(x), float(y), 3)
+            ev.accept()
+            return
+
+        # middle/other: pass through (pan/zoom etc.)
+        super().mousePressEvent(ev)
+
 
     def mouseMoveEvent(self, ev):
         # Update movement tracking for click detection
@@ -675,14 +701,23 @@ class PGImagePanel(pg.PlotWidget):
 
     def mouseReleaseEvent(self, ev):
         if ev.button() == Qt.MouseButton.LeftButton:
-            if self._possible_click: # Was a clean click (no drag) on empty space
-                pos = self._map_scene_to_image(ev.position())
-                if pos:
-                     self.pressed.emit(pos[0], pos[1], 1)
+            if self._possible_click:
+                img = getattr(self, "_current_img", None)
+                if img is not None:
+                    pos = self._map_scene_to_image(ev.position())
+                    if pos:
+                        x, y = pos
+                        # optional: nur wenn inside image
+                        a = np.asarray(img)
+                        H, W = a.shape[0], a.shape[1]
+                        if 0 <= x < W and 0 <= y < H:
+                            self.pressed.emit(float(x), float(y), 1)
+
                 self._possible_click = False
-        
+
         self.released.emit()
         super().mouseReleaseEvent(ev)
+
 
     def reset_view(self):
         if getattr(self, "native_1to1", False):
