@@ -26,6 +26,7 @@ class MotionCorrectionGUI(QMainWindow):
         self.setWindowTitle("Motion Correction GUI")
         screen = QApplication.primaryScreen()
         g = screen.availableGeometry()
+        self._initial_zoom_done = False
 
         w = int(g.width() * 0.8)
         h = int(g.height() * 0.8)
@@ -1707,6 +1708,11 @@ class MotionCorrectionGUI(QMainWindow):
         self._render_view(self.view_left, left_choice, idx, filtered, levels)
         self._render_view(self.view_right, right_choice, idx, filtered, levels)
 
+        if not getattr(self, "_initial_zoom_done", False):
+            self.view_left.reset_view()
+            self.view_right.reset_view()
+            self._initial_zoom_done = True
+
         # cursor in motion plot
         if hasattr(self, "motion_plot"):
             self.motion_plot.set_current_frame(self.current_frame)
@@ -1770,7 +1776,8 @@ class MotionCorrectionGUI(QMainWindow):
 
             
             # ensure view includes outside points too (use full ptsA, not just pts_show)
-            panel.fit_view_to_image_and_points(ptsA, margin=20)
+            if not (self.edit_points_mode or self.edit_tracks_mode):
+                panel.fit_view_to_image_and_points(ptsA, margin=20)
 
             # draw trajectories ONLY here
             panel.set_trajectories(tr, idx, trail=15)
@@ -1869,12 +1876,15 @@ class MotionCorrectionGUI(QMainWindow):
         if self.video_data is None:
             return
 
+        self._initial_zoom_done = False
+        QTimer.singleShot(0, self.reset_all_zoom)
+
         # Ensure edit modes are inactive while processing
         if self.edit_points_btn.isChecked():
             self.edit_points_btn.setChecked(False)
         if self.edit_tracks_btn.isChecked():
             self.edit_tracks_btn.setChecked(False)
-
+        
         self.timer.stop()
         self.is_playing = False
         self.play_btn.setText("▶")

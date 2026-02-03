@@ -328,10 +328,10 @@ class ProcessingWorker(QThread):
 
 
 class PGImagePanel(pg.PlotWidget):
-    pressed  = pyqtSignal(float, float, int)   # x,y,button (1/2/3)
+    pressed  = pyqtSignal(float, float, int)
     moved    = pyqtSignal(float, float)
     released = pyqtSignal()
-    clicked_outside_image = pyqtSignal()     
+    clicked_outside_image = pyqtSignal() 
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -631,89 +631,92 @@ class PGImagePanel(pg.PlotWidget):
                  
         return False
 
-    def mousePressEvent(self, ev):
-        btn_int = self._qt_btn_to_int(ev.button())
+    def _img_shape_hw(self):
+        img = getattr(self, "_current_img", None)
+        if img is None:
+            return None
+        a = np.asarray(img)
+        if a.ndim == 2:
+            return int(a.shape[0]), int(a.shape[1])
+        return int(a.shape[0]), int(a.shape[1])  # (H,W,C)
 
-        # Map to image coords (x,y in image space)
-        pos_xy = self._map_scene_to_image(ev.position())
-        if pos_xy is None:
+    def mousePressEvent(self, ev):
+        btn = ev.button()
+
+        # Map click to image coords (view coords)
+        pos = self._map_scene_to_image(ev.position())
+        if pos is None:
             super().mousePressEvent(ev)
             return
 
-        x, y = pos_xy
+        x, y = pos
 
-        # If no image is displayed -> outside
-        img = getattr(self, "_current_img", None)
-        if img is None:
+        # outside-image detection (for exiting edit modes)
+        hw = self._img_shape_hw()
+        if hw is None:
+            # no image -> treat as outside
             self.clicked_outside_image.emit()
-            ev.accept()
+            super().mousePressEvent(ev)
             return
 
-        a = np.asarray(img)
-        H, W = (a.shape[0], a.shape[1])  # works for 2D or (H,W,C)
-
-        # Outside image rect?
-        if (x < 0) or (y < 0) or (x >= W) or (y >= H):
+        H, W = hw
+        outside = (x < 0) or (y < 0) or (x >= W) or (y >= H)
+        if outside:
             self.clicked_outside_image.emit()
-            ev.accept()
+            # IMPORTANT: still pass to super so pan/zoom works in the black border too
+            super().mousePressEvent(ev)
             return
 
-        # ---- INSIDE IMAGE: normal behavior ----
-        if btn_int == 1:
-            # left click: if over point -> start drag/edit, else maybe add point on release
+        # ----- INSIDE IMAGE -----
+
+        if btn == Qt.MouseButton.LeftButton:
+            # if click over a point: start "edit drag" (consume event -> no pan)
             if self._is_over_point(ev.position()):
-                self._possible_click = False
-                self.last_mouse_pos = None
                 self.pressed.emit(float(x), float(y), 1)
                 ev.accept()
                 return
-            else:
-                self._possible_click = True
-                self.last_mouse_pos = ev.position()
-                # don't emit pressed here; you do it on release if it stays a click
-                ev.accept()
-                return
 
-        if btn_int == 3:
-            # right click: delete/toggle etc -> emit immediately
-            self._possible_click = False
-            self.last_mouse_pos = None
+            # empty area: could be click (add point) OR drag (pan)
+            self._possible_click = True
+            self.last_mouse_pos = ev.position()
+            # DO NOT emit pressed here (otherwise you "add" immediately and kill pan)
+
+        elif btn == Qt.MouseButton.RightButton:
+            # right click should trigger delete/toggle immediately, but still no pan
             self.pressed.emit(float(x), float(y), 3)
             ev.accept()
             return
 
-        # middle/other: pass through (pan/zoom etc.)
+        # Let pyqtgraph handle pan/zoom drag
         super().mousePressEvent(ev)
 
-
     def mouseMoveEvent(self, ev):
-        # Update movement tracking for click detection
-        if self._possible_click:
+        # detect if user started dragging -> then it is NOT a click
+        if self._possible_click and self.last_mouse_pos is not None:
             dist = (ev.position() - self.last_mouse_pos).manhattanLength()
-            if dist > 5: # Threshold for drag
+            if dist > 5:
                 self._possible_click = False
 
         pos = self._map_scene_to_image(ev.position())
         if pos:
-            self.moved.emit(pos[0], pos[1])
-            
+            self.moved.emit(float(pos[0]), float(pos[1]))
+
         super().mouseMoveEvent(ev)
 
     def mouseReleaseEvent(self, ev):
-        if ev.button() == Qt.MouseButton.LeftButton:
-            if self._possible_click:
-                img = getattr(self, "_current_img", None)
-                if img is not None:
-                    pos = self._map_scene_to_image(ev.position())
-                    if pos:
-                        x, y = pos
-                        # optional: nur wenn inside image
-                        a = np.asarray(img)
-                        H, W = a.shape[0], a.shape[1]
-                        if 0 <= x < W and 0 <= y < H:
-                            self.pressed.emit(float(x), float(y), 1)
+        # if it was a clean left-click on empty space (no drag), emit pressed once here
+        if ev.button() == Qt.MouseButton.LeftButton and self._possible_click:
+            pos = self._map_scene_to_image(ev.position())
+            if pos:
+                x, y = pos
+                hw = self._img_shape_hw()
+                if hw is not None:
+                    H, W = hw
+                    if not ((x < 0) or (y < 0) or (x >= W) or (y >= H)):
+                        self.pressed.emit(float(x), float(y), 1)
 
-                self._possible_click = False
+        self._possible_click = False
+        self.last_mouse_pos = None
 
         self.released.emit()
         super().mouseReleaseEvent(ev)
