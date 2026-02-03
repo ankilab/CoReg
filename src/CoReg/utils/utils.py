@@ -1,3 +1,4 @@
+import os
 import sys
 import numpy as np
 import cv2
@@ -9,6 +10,43 @@ import h5py
 from pathlib import Path
 import hdf5plugin
 import imageio.v3 as io
+
+
+def resize_video_tensor_to_wh( video_t: torch.Tensor, target_w: int, target_h: int) -> torch.Tensor:
+    """
+    Resize (T,C,H,W) tensor to exact target_w/target_h.
+    Arguments order is (target_w, target_h).
+    """
+    if video_t is None:
+        return video_t
+
+    if not isinstance(video_t, torch.Tensor):
+        video_t = torch.as_tensor(video_t)
+
+    # normalize to (T,C,H,W) if someone passes (T,H,W)
+    if video_t.ndim == 3:
+        video_t = video_t.unsqueeze(1)
+
+    T, C, H, W = video_t.shape
+    target_w = int(target_w)
+    target_h = int(target_h)
+
+    if target_w <= 0 or target_h <= 0:
+        return video_t
+    if target_w == W and target_h == H:
+        return video_t
+
+    orig_dtype = video_t.dtype
+    vt = video_t.float()
+
+    # interpolate expects size=(H, W)
+    vt = F.interpolate(vt, size=(target_h, target_w), mode="bilinear", align_corners=False)
+
+    # keep integer types if you want
+    if orig_dtype in (torch.uint8, torch.int16, torch.int32, torch.int64):
+        vt = vt.clamp(0, 255).to(orig_dtype)
+
+    return vt
 
 
 def _ensure_3ch_uint8(video_np):
@@ -342,3 +380,84 @@ def video_ssim_score(video, mode="ref_first"):
     # consecutive
     scores = [(frames_u8[t] - frames_u8[t - 1]) for t in range(1, T)]
     return float(np.mean(scores)) if scores else 0.0
+
+
+def probe_media_info(path: str):
+    """
+    Try to get (frames, width, height) without loading full data.
+    Works for: mp4/avi via cv2, tiff via tifffile (if available), h5 via h5py (if available).
+    Returns (frames, w, h) possibly None for unknown fields.
+    """
+    ext = os.path.splitext(path)[1].lower()
+
+    # video container
+    if ext in [".avi", ".mp4", ".mov", ".mkv"]:
+        cap = cv2.VideoCapture(path)
+        if not cap.isOpened():
+            return None, None, None
+        frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+        w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+        h = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+        cap.release()
+        frames = int(frames) if frames and frames > 0 else None
+        w = int(w) if w and w > 0 else None
+        h = int(h) if h and h > 0 else None
+        return frames, w, h
+
+    # tiff stack
+    if ext in [".tif", ".tiff"]:
+        try:
+            import tifffile
+            with tifffile.TiffFile(path) as tf:
+                pages = len(tf.pages)
+                # first page shape (H,W) or (H,W,C)
+                shp = tf.pages[0].shape
+                if len(shp) >= 2:
+                    h, w = int(shp[0]), int(shp[1])
+                else:
+                    h, w = None, None
+            return int(pages) if pages else None, w, h
+        except Exception:
+            return None, None, None
+
+    # hdf5
+    if ext in [".h5", ".hdf5"]:
+        try:
+            import h5py
+            with h5py.File(path, "r") as f:
+                dset = None
+                # prefer /data if present
+                if "/data" in f:
+                    dset = f["/data"]
+                else:
+                    # pick first dataset found
+                    def _first_dataset(g):
+                        for k in g.keys():
+                            obj = g[k]
+                            if isinstance(obj, h5py.Dataset):
+                                return obj
+                            if isinstance(obj, h5py.Group):
+                                r = _first_dataset(obj)
+                                if r is not None:
+                                    return r
+                        return None
+                    dset = _first_dataset(f)
+
+                if dset is None:
+                    return None, None, None
+
+                shp = dset.shape
+                # common layouts:
+                # (T,H,W) or (T,C,H,W)
+                frames = int(shp[0]) if len(shp) >= 1 else None
+                if len(shp) == 3:
+                    h, w = int(shp[1]), int(shp[2])
+                elif len(shp) >= 4:
+                    h, w = int(shp[-2]), int(shp[-1])
+                else:
+                    h, w = None, None
+            return frames, w, h
+        except Exception:
+            return None, None, None
+
+    return None, None, None

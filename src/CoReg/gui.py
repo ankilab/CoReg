@@ -13,9 +13,8 @@ from PyQt6.QtGui import QImage, QPixmap, QPainter, QColor, QPalette
 import pyqtgraph as pg
 from utils.mc_cotracker import cotrack_model, warping
 pg.setConfigOptions(imageAxisOrder='row-major')  # damit (H,W) wie numpy angezeigt wird
-
-
-import cv2
+import math
+import torch.nn.functional as F
 try:
     import ants
 except ImportError:
@@ -842,6 +841,133 @@ class ParameterDialog(QDialog):
         self.close_btn = QPushButton("Close")
         self.close_btn.clicked.connect(self.hide)
         outer.addWidget(self.close_btn)
+
+class VideoLoadSettingsDialog(QDialog):
+    """
+    Shows original video (frames, width, height) and allows user to load original,
+    or choose smaller width/height + fewer frames.
+    """
+    def __init__(self, parent, orig_frames: int | None, orig_w: int | None, orig_h: int | None):
+        super().__init__(parent)
+        self.setWindowTitle("Load settings")
+
+        self.orig_frames = orig_frames
+        self.orig_w = orig_w
+        self.orig_h = orig_h
+
+        layout = QVBoxLayout(self)
+
+        # --- info labels ---
+        f_txt = str(orig_frames) if orig_frames is not None else "unknown"
+        w_txt = str(orig_w) if orig_w is not None else "unknown"
+        h_txt = str(orig_h) if orig_h is not None else "unknown"
+
+        self.info_lbl = QLabel(f"Original:\n  Frames: {f_txt}\n  Size: {w_txt} × {h_txt}")
+        self.info_lbl.setStyleSheet("font-size: 12px;")
+        layout.addWidget(self.info_lbl)
+
+        layout.addSpacing(8)
+
+        # --- resize controls ---
+        self.keep_original_size_chk = QCheckBox("Keep original size")
+        self.keep_original_size_chk.setChecked(True)
+        layout.addWidget(self.keep_original_size_chk)
+
+        wh_row = QHBoxLayout()
+        wh_row.addWidget(QLabel("Target W:"))
+        self.w_spin = QSpinBox()
+        self.w_spin.setRange(1, 100000)
+        self.w_spin.setValue(int(orig_w) if orig_w else 512)
+        self.w_spin.setEnabled(False)
+        wh_row.addWidget(self.w_spin)
+
+        wh_row.addSpacing(10)
+
+        wh_row.addWidget(QLabel("Target H:"))
+        self.h_spin = QSpinBox()
+        self.h_spin.setRange(1, 100000)
+        self.h_spin.setValue(int(orig_h) if orig_h else 512)
+        self.h_spin.setEnabled(False)
+        wh_row.addWidget(self.h_spin)
+        layout.addLayout(wh_row)
+
+        # optional: quick hint
+        self.hint_lbl = QLabel("Tip: choose smaller W/H to reduce memory + speed up tracking.")
+        self.hint_lbl.setStyleSheet("color: #666; font-size: 11px;")
+        layout.addWidget(self.hint_lbl)
+
+        layout.addSpacing(6)
+
+        # --- frames controls ---
+        self.load_all_frames_chk = QCheckBox("Load all frames")
+        self.load_all_frames_chk.setChecked(True)
+        layout.addWidget(self.load_all_frames_chk)
+
+        frames_row = QHBoxLayout()
+        frames_row.addWidget(QLabel("Max frames:"))
+        self.max_frames_spin = QSpinBox()
+        self.max_frames_spin.setRange(1, 10_000_000)
+        self.max_frames_spin.setValue(int(orig_frames) if orig_frames else 30)
+        self.max_frames_spin.setEnabled(False)
+        frames_row.addWidget(self.max_frames_spin)
+        layout.addLayout(frames_row)
+
+        # --- buttons (single load) ---
+        btn_row = QHBoxLayout()
+        self.btn_load = QPushButton("Load")
+        self.btn_cancel = QPushButton("Cancel")
+        btn_row.addWidget(self.btn_load)
+        btn_row.addWidget(self.btn_cancel)
+        layout.addLayout(btn_row)
+
+        # wiring
+        self.keep_original_size_chk.stateChanged.connect(self._update_enabled)
+        self.load_all_frames_chk.stateChanged.connect(self._update_enabled)
+        self.btn_load.clicked.connect(self._accept)
+        self.btn_cancel.clicked.connect(self.reject)
+
+        # outputs
+        self._result = None  # dict or None
+
+    def _update_enabled(self, *_):
+        self.w_spin.setEnabled(not self.keep_original_size_chk.isChecked())
+        self.h_spin.setEnabled(not self.keep_original_size_chk.isChecked())
+        self.max_frames_spin.setEnabled(not self.load_all_frames_chk.isChecked())
+
+        # when "keep original" is checked, snap fields back to original (if known)
+        if self.keep_original_size_chk.isChecked():
+            if self.orig_w:
+                self.w_spin.setValue(int(self.orig_w))
+            if self.orig_h:
+                self.h_spin.setValue(int(self.orig_h))
+
+        if self.load_all_frames_chk.isChecked():
+            if self.orig_frames:
+                self.max_frames_spin.setValue(int(self.orig_frames))
+
+    def _accept(self):
+        # width/height: None means "use original"
+        if self.keep_original_size_chk.isChecked():
+            target_w = None
+            target_h = None
+        else:
+            target_w = int(self.w_spin.value())
+            target_h = int(self.h_spin.value())
+
+        # max_frames: None means "all frames"
+        max_frames = None if self.load_all_frames_chk.isChecked() else int(self.max_frames_spin.value())
+
+        self._result = {
+            "target_w": target_w,
+            "target_h": target_h,
+            "max_frames": max_frames,
+        }
+        self.accept()
+
+    def result_settings(self):
+        return self._result
+
+
 
 
 

@@ -2,6 +2,8 @@ import os
 import numpy as np
 import torch
 import cv2
+import math
+import torch.nn.functional as F
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QPushButton, QSlider, QLabel, QVBoxLayout, QHBoxLayout,
     QFileDialog, QCheckBox, QGridLayout, QComboBox, QSpinBox, QSizePolicy, QProgressBar, QDialog,
@@ -10,13 +12,13 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QTimer, QThread, QElapsedTimer
 from PyQt6.QtGui import QImage, QPixmap, QPainter, QColor, QPalette
 import pyqtgraph as pg
-from gui import ParameterDialog, PGImagePanel, MotionProfileWidget, ProcessingWorker
+from gui import ParameterDialog, PGImagePanel, MotionProfileWidget, ProcessingWorker, VideoLoadSettingsDialog
 
 
 
 # Add current directory to path to allow imports
 # sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from utils.utils import load_video, load_tiff, load_hdf5
+from utils.utils import load_video, load_tiff, load_hdf5, probe_media_info, resize_video_tensor_to_wh
 pg.setConfigOptions(imageAxisOrder='row-major')  # damit (H,W) wie numpy angezeigt wird
 from utils.utils import video_ssim_score
 
@@ -1150,12 +1152,22 @@ class MotionCorrectionGUI(QMainWindow):
             "All files (*.*)"
         ])
         file_dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
+
         if file_dialog.exec():
             selected_files = file_dialog.selectedFiles()
-            if selected_files:
-                self.video_path = selected_files[0]
-                self.status_label.setText(f"Loading: {os.path.basename(self.video_path)}")
-                self.load_data()
+            if not selected_files:
+                return
+
+            self.video_path = selected_files[0]
+            self.status_label.setText(f"Selected: {os.path.basename(self.video_path)}")
+
+            settings = self._show_load_settings_dialog()
+            if settings is None:
+                self.status_label.setText("Load canceled.")
+                return
+
+            self.load_data(load_settings=settings)
+
 
     def _gather_existing_points(self):
         pts = []
@@ -1556,38 +1568,99 @@ class MotionCorrectionGUI(QMainWindow):
                 self.status_label.setText(f"Loading: {os.path.basename(self.video_path)}")
                 self.load_data()
 
-    def load_data(self):
+    def load_data(self, load_settings=None):
         if not self.video_path:
             return
+
+        if load_settings is None:
+            load_settings = {"target_w": None, "target_h": None, "max_frames": None}
+
+        target_w = load_settings.get("target_w", None)   # None => keep original
+        target_h = load_settings.get("target_h", None)   # None => keep original
+        max_frames = load_settings.get("max_frames", None)  # None => all frames
 
         self.clear_all_data()
         ext = os.path.splitext(self.video_path)[1].lower()
         self.status_label.setText("Loading data...")
         QApplication.processEvents()
-        num_frames = 30
+
         try:
+            # -----------------------------
+            # 1) LOAD (as torch tensor)
+            # -----------------------------
             if ext in ['.avi', '.mp4']:
-                self.video_data = load_video(self.video_path, resize=False, max_frames=30)
+                # load_video returns torch in your pipeline (T,C,H,W) likely
+                video_t = load_video(self.video_path, resize=False, max_frames=max_frames)
+
+                # enforce torch
+                if not isinstance(video_t, torch.Tensor):
+                    video_t = torch.from_numpy(np.asarray(video_t))
+
+                # normalize to (T,C,H,W) if needed
+                if video_t.ndim == 3:  # (T,H,W)
+                    video_t = video_t.unsqueeze(1)
+                elif video_t.ndim == 4 and video_t.shape[1] not in (1, 3) and video_t.shape[-1] in (1, 3):
+                    # (T,H,W,C) -> (T,C,H,W)
+                    video_t = video_t.permute(0, 3, 1, 2)
+
             elif ext in ['.tiff', '.tif']:
-                # Resize by default false (why should it be true?)
-                video_np = load_tiff(self.video_path, resize=False) # Load all (up to sensible limit) or modify util
+                video_t = load_tiff(self.video_path, resize=False)
 
-                # unsqueeze and repeat not needed here... as well as numpy conversion, already tensor
-                self.video_data = video_np
+                if not isinstance(video_t, torch.Tensor):
+                    video_t = torch.from_numpy(np.asarray(video_t))
+
+                if video_t.ndim == 3:  # (T,H,W)
+                    video_t = video_t.unsqueeze(1)
+                elif video_t.ndim == 4 and video_t.shape[1] not in (1, 3) and video_t.shape[-1] in (1, 3):
+                    video_t = video_t.permute(0, 3, 1, 2)
+
+                if max_frames is not None:
+                    video_t = video_t[:int(max_frames)]
+
             elif ext in ['.h5', '.hdf5']:
-                # Why is it /data and frames=30 hardcoded?
-                video_np = load_hdf5(self.video_path, "/data", frames=30)
+                frames_arg = int(max_frames) if max_frames is not None else None
 
-                # conversion here also maybe not needed
-                self.video_data = torch.from_numpy(video_np).unsqueeze(1).repeat(1, 3, 1, 1).float()
+                if frames_arg is None:
+                    # try load all
+                    try:
+                        video_np = load_hdf5(self.video_path, "/data", frames=None)
+                    except Exception:
+                        # fallback to prior behavior
+                        video_np = load_hdf5(self.video_path, "/data", frames=None)
+                else:
+                    video_np = load_hdf5(self.video_path, "/data", frames=frames_arg)
+
+                if isinstance(video_np, torch.Tensor):
+                    video_t = video_np
+                else:
+                    video_t = torch.from_numpy(np.asarray(video_np))
+
+                if video_t.ndim == 3:  # (T,H,W)
+                    video_t = video_t.unsqueeze(1)
+
+                # your old behavior: repeat grayscale to 3ch
+                if video_t.shape[1] == 1:
+                    video_t = video_t.repeat(1, 3, 1, 1)
+
+                video_t = video_t.float()
+
             else:
                 self.status_label.setText(f"Unsupported file extension: {ext}")
                 return
 
+            # -----------------------------
+            # 2) RESIZE by target W/H
+            # -----------------------------
+            if (target_w is not None) and (target_h is not None):
+                video_t = resize_video_tensor_to_wh(video_t, target_w=int(target_w), target_h=int(target_h))
+
+            self.video_data = video_t
+
+            # -----------------------------
+            # 3) Continue with existing UI logic
+            # -----------------------------
             self.apply_point_preset()
             self.undo_btn.setEnabled(True)
-
-            self.status_label.setText(f"Loaded: {os.path.basename(self.video_path)}")
 
             self.total_frames = int(self.video_data.shape[0])
             self.slider.setMinimum(0)
@@ -1608,6 +1681,14 @@ class MotionCorrectionGUI(QMainWindow):
             self.step_fwd_btn.setEnabled(True)
             self.step_back_btn.setEnabled(True)
 
+            # Show what was actually loaded
+            T = int(self.video_data.shape[0])
+            H = int(self.video_data.shape[-2])
+            W = int(self.video_data.shape[-1])
+            self.status_label.setText(
+                f"Loaded: {os.path.basename(self.video_path)} | Frames: {T} | Size: {W}×{H}"
+            )
+
             self.update_plot()
             QTimer.singleShot(100, lambda: self.reset_all_zoom())
 
@@ -1616,64 +1697,48 @@ class MotionCorrectionGUI(QMainWindow):
             self.video_data = None
             return
 
-        # Calculate correlation scores for the loaded video
+        # -----------------------------
+        # 4) Your correlation code (unchanged)
+        # -----------------------------
         try:
-             # video_data is (T, C, H, W)
-             # Use grayscale for correlation
-             # We want to be fast, so downsample
-             gray_full = self._get_gray_video_np() # (T, H, W)
-             
-             # Downsample for speed (e.g., 64x64 or 128x128)
-             # We just need global correlation trend.
-             T, H, W = gray_full.shape
-             
-             target_dim = 64
-             scale = min(target_dim/H, target_dim/W)
-             if scale < 1.0:
-                 dsize = (int(W*scale), int(H*scale))
-                 # Use cv2 for resizing frames
-                 gray_small = []
-                 for i in range(T):
-                     gray_small.append(cv2.resize(gray_full[i], dsize, interpolation=cv2.INTER_AREA))
-                 gray_small = np.array(gray_small) # (T, h, w)
-             else:
-                 gray_small = gray_full
+            gray_full = self._get_gray_video_np()  # (T, H, W)
 
-             # L2 Norm of Normalized Difference (effectively correlation distance)
-             # Normalize each frame: (x - mean) / std
-             flat = gray_small.reshape(T, -1).astype(np.float32)
-             means = flat.mean(axis=1, keepdims=True)
-             stds = flat.std(axis=1, keepdims=True) + 1e-6
-             flat_norm = (flat - means) / stds
-             
-             # Difference between t and t+1
-             if T > 1:
-                 # diffs[t] = frame[t+1] - frame[t]
-                 diffs = flat_norm[1:] - flat_norm[:-1]
-                 
-                 # L2 norm per frame
-                 # Norm(u - v) where |u|=|v|=Constant roughly
-                 l2_norms = np.linalg.norm(diffs, axis=1)
-                 
-                 # Normalize to 0..1 for visualization
-                 # 0 = No motion, 1 = Max motion
-                 max_val = l2_norms.max()
-                 if max_val > 1e-6:
-                     scores = l2_norms / max_val
-                 else:
-                     scores = np.zeros_like(l2_norms)
-                 
-                 # Pad to length T
-                 # User wants score[0]=0, score[t]=diff(t, t-1)
-                 scores = np.concatenate([[0.0], scores])
-                 
-                 self.motion_plot.set_data(scores)
-             else:
-                 self.motion_plot.set_data([0.0])
+            T, H, W = gray_full.shape
+            target_dim = 64
+            scale = min(target_dim / H, target_dim / W)
+            if scale < 1.0:
+                dsize = (int(W * scale), int(H * scale))
+                gray_small = []
+                for i in range(T):
+                    gray_small.append(cv2.resize(gray_full[i], dsize, interpolation=cv2.INTER_AREA))
+                gray_small = np.array(gray_small)
+            else:
+                gray_small = gray_full
+
+            flat = gray_small.reshape(T, -1).astype(np.float32)
+            means = flat.mean(axis=1, keepdims=True)
+            stds = flat.std(axis=1, keepdims=True) + 1e-6
+            flat_norm = (flat - means) / stds
+
+            if T > 1:
+                diffs = flat_norm[1:] - flat_norm[:-1]
+                l2_norms = np.linalg.norm(diffs, axis=1)
+
+                max_val = l2_norms.max()
+                if max_val > 1e-6:
+                    scores = l2_norms / max_val
+                else:
+                    scores = np.zeros_like(l2_norms)
+
+                scores = np.concatenate([[0.0], scores])
+                self.motion_plot.set_data(scores)
+            else:
+                self.motion_plot.set_data([0.0])
 
         except Exception as e:
-             print(f"Error calculating correlation: {e}")
-             self.motion_plot.set_data([])
+            print(f"Error calculating correlation: {e}")
+            self.motion_plot.set_data([])
+
 
 
     def toggle_edit_mode(self, *args):
@@ -3313,10 +3378,17 @@ class MotionCorrectionGUI(QMainWindow):
                 ext = os.path.splitext(file_path)[1].lower()
                 if ext in ['.avi', '.mp4', '.tiff', '.tif', '.h5', '.hdf5']:
                     self.video_path = file_path
-                    self.status_label.setText(f"Loading: {os.path.basename(self.video_path)}")
-                    self.load_data()
+                    self.status_label.setText(f"Selected: {os.path.basename(self.video_path)}")
+
+                    settings = self._show_load_settings_dialog()
+                    if settings is None:
+                        self.status_label.setText("Load canceled.")
+                        return
+
+                    self.load_data(load_settings=settings)
                     event.acceptProposedAction()
                     return
+
 
     def closeEvent(self, event):
         if self.worker is not None:
@@ -3405,3 +3477,39 @@ class MotionCorrectionGUI(QMainWindow):
             self.status_label.setText(f"Error saving: {e}")
             print(e)
     
+    def _show_load_settings_dialog(self):
+        if not self.video_path:
+            return None
+
+        frames, w, h = probe_media_info(self.video_path)
+        dlg = VideoLoadSettingsDialog(self, frames, w, h)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            return dlg.result_settings()
+        return None
+    
+    def _downscale_video_tensor(self, video_t: torch.Tensor, scale: float) -> torch.Tensor:
+        """
+        video_t: (T,C,H,W) float/uint
+        scale: 0<scale<=1
+        """
+        scale = float(scale)
+        if scale >= 0.999:
+            return video_t
+
+        if not isinstance(video_t, torch.Tensor):
+            video_t = torch.as_tensor(video_t)
+
+        # ensure float for interpolation then cast back
+        orig_dtype = video_t.dtype
+        vt = video_t.float()
+
+        T, C, H, W = vt.shape
+        new_h = max(1, int(math.floor(H * scale)))
+        new_w = max(1, int(math.floor(W * scale)))
+
+        vt = F.interpolate(vt, size=(new_h, new_w), mode="bilinear", align_corners=False)
+
+        # cast back if you want (usually keep float is fine, but your display clamps anyway)
+        if orig_dtype in (torch.uint8, torch.int16, torch.int32, torch.int64):
+            vt = vt.clamp(0, 255).to(orig_dtype)
+        return vt
