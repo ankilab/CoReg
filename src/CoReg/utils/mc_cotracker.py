@@ -19,10 +19,8 @@ import gc
 torch.cuda.empty_cache()
 gc.collect()
 
-# Currently my hack for ensuring it is CPU only
-DEFAULT_DEVICE = (
-    "cpu" #"cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
-)
+
+
 
 def load_video(file, resize=True):
     """
@@ -48,7 +46,7 @@ def load_video(file, resize=True):
 
     return video[:10] ##<-- for testing, use only first 10 frames?! why is this hard coded
 
-def cotrack_model(video, queries, grid_size=0):
+def cotrack_model(video, queries, device, grid_size=0):
     """"Run the CoTracker model on the provided video and grid points.
     Model defines which cotracker model is used for tracking.
     args:
@@ -66,14 +64,14 @@ def cotrack_model(video, queries, grid_size=0):
     os.environ["TORCH_HOME"] = "/data/users/va11moje/cache/cotracker"
 
     model = torch.hub.load("facebookresearch/co-tracker", "cotracker3_offline")
-    model = model.to(DEFAULT_DEVICE)
-    video = video.to(DEFAULT_DEVICE)
+    model = model.to(device)
+    video = video.to(device)
     model.model.model_resolution = video.shape[2:]
 
     
     pred_tracks, pred_visibility = model(
-        video.unsqueeze(0).to(DEFAULT_DEVICE),
-        queries=queries.to(DEFAULT_DEVICE),
+        video.unsqueeze(0).to(device),
+        queries=queries.to(device),
         grid_size=grid_size,
         grid_query_frame=0,      # ignored when queries is provided, but fine to keep
         backward_tracking=False
@@ -247,7 +245,7 @@ def warping(predicted_tracks, frames, smoothing=3,
         src = get_frame_gray(i).astype(np.float32, copy=False)
 
         # mild anti-aliasing blur (tune sigma: 0.5 to 1.5 typically)
-        src = cv2.GaussianBlur(src, (0, 0), 0.8)
+        # src = cv2.GaussianBlur(src, (0, 0), 0.8)
 
         warped = map_coordinates(
             src,
