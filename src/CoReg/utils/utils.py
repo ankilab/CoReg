@@ -1,21 +1,28 @@
 import os
-import sys
-import numpy as np
+from pathlib import Path
 import cv2
+import h5py
+import numpy as np
+import tifffile
 import torch
 import torch.nn.functional as F
 from cotracker.utils.visualizer import read_video_from_path
-import tifffile
-import h5py
-from pathlib import Path
-import hdf5plugin
-import imageio.v3 as io
 
 
-def resize_video_tensor_to_wh( video_t: torch.Tensor, target_w: int, target_h: int) -> torch.Tensor:
+# -----------------------------
+# Resizing / conversion helpers
+# -----------------------------
+def resize_video_tensor_to_wh(video_t: torch.Tensor, target_w: int, target_h: int) -> torch.Tensor:
     """
-    Resize (T,C,H,W) tensor to exact target_w/target_h.
-    Arguments order is (target_w, target_h).
+    Resize a video tensor to exact (target_w, target_h).
+
+    Args:
+        video_t: torch Tensor shaped (T,C,H,W) or (T,H,W)
+        target_w: target width
+        target_h: target height
+
+    Returns:
+        torch Tensor shaped (T,C,target_h,target_w) with dtype preserved when reasonable.
     """
     if video_t is None:
         return video_t
@@ -23,9 +30,11 @@ def resize_video_tensor_to_wh( video_t: torch.Tensor, target_w: int, target_h: i
     if not isinstance(video_t, torch.Tensor):
         video_t = torch.as_tensor(video_t)
 
-    # normalize to (T,C,H,W) if someone passes (T,H,W)
-    if video_t.ndim == 3:
+    if video_t.ndim == 3:  # (T,H,W) -> (T,1,H,W)
         video_t = video_t.unsqueeze(1)
+
+    if video_t.ndim != 4:
+        raise ValueError(f"Expected (T,C,H,W) or (T,H,W), got shape {tuple(video_t.shape)}")
 
     T, C, H, W = video_t.shape
     target_w = int(target_w)
@@ -38,65 +47,109 @@ def resize_video_tensor_to_wh( video_t: torch.Tensor, target_w: int, target_h: i
 
     orig_dtype = video_t.dtype
     vt = video_t.float()
-
-    # interpolate expects size=(H, W)
     vt = F.interpolate(vt, size=(target_h, target_w), mode="bilinear", align_corners=False)
 
-    # keep integer types if you want
+    # preserve integer-ish types if input was integer-like
     if orig_dtype in (torch.uint8, torch.int16, torch.int32, torch.int64):
         vt = vt.clamp(0, 255).to(orig_dtype)
+    else:
+        vt = vt.to(orig_dtype)
 
     return vt
 
 
-def _ensure_3ch_uint8(video_np):
+def _ensure_thwc_rgb_uint8(video_np: np.ndarray) -> np.ndarray:
     """
-    video_np: (T,H,W) or (T,H,W,3) or (H,W) etc.
-    Returns: (T,H,W,3) uint8
+    Ensure video is (T,H,W,3) uint8.
+
+    Accepts:
+      - (H,W)
+      - (T,H,W)
+      - (H,W,3)
+      - (T,H,W,3)
+      - (T,H,W,4) (drops alpha)
+
+    Returns:
+      (T,H,W,3) uint8
     """
     v = np.asarray(video_np)
+
     if v.ndim == 2:  # (H,W)
-        v = v[None, ...]  # (1,H,W)
+        v = v[None, ..., None]  # (1,H,W,1)
 
-    if v.ndim == 3:  # (T,H,W)
-        # grayscale -> 3ch
-        v3 = np.stack([v, v, v], axis=-1)  # (T,H,W,3)
-        return v3.astype(np.uint8)
+    if v.ndim == 3:
+        # could be (T,H,W) or (H,W,C)
+        if v.shape[-1] in (3, 4):  # (H,W,C)
+            v = v[None, ...]  # (1,H,W,C)
+        else:
+            v = v[..., None]  # (T,H,W,1)
 
-    if v.ndim == 4 and v.shape[-1] == 3:
-        return v.astype(np.uint8)
+    if v.ndim != 4:
+        raise ValueError(f"Unsupported video shape: {v.shape}")
 
-    if v.ndim == 4 and v.shape[-1] == 4:
-        return v[..., :3].astype(np.uint8)
+    # Drop alpha
+    if v.shape[-1] == 4:
+        v = v[..., :3]
 
-    raise ValueError(f"Unsupported video shape for 3ch: {v.shape}")
+    # Gray -> RGB
+    if v.shape[-1] == 1:
+        v = np.repeat(v, 3, axis=-1)
+
+    if v.shape[-1] != 3:
+        raise ValueError(f"Unsupported channel count: {v.shape}")
+
+    return v.astype(np.uint8, copy=False)
 
 
-def _maybe_resize_video_THWC(video_thwc, resize=True, size=(256, 256)):
+def _resize_video_thwc(video_thwc: np.ndarray, resize: bool, target_size_wh=(256, 256)) -> np.ndarray:
     """
-    video_thwc: (T,H,W,C)
-    size: (W,H) for cv2
+    Resize THWC video using OpenCV.
+
+    Args:
+        video_thwc: (T,H,W,C)
+        resize: bool
+        target_size_wh: (W,H)
+
+    Returns:
+        (T,H,W,C)
     """
     if not resize:
-        return video_thwc
+        return np.ascontiguousarray(video_thwc)
+
+    target_w, target_h = int(target_size_wh[0]), int(target_size_wh[1])
     out = []
     for fr in video_thwc:
-        out.append(cv2.resize(fr, size, interpolation=cv2.INTER_AREA))
+        out.append(cv2.resize(fr, (target_w, target_h), interpolation=cv2.INTER_AREA))
     return np.ascontiguousarray(np.stack(out, axis=0))
 
 
-def _to_torch_TCHW(video_thwc_uint8):
-    """(T,H,W,3) uint8 -> torch float (T,3,H,W)"""
-    video_t = torch.from_numpy(video_thwc_uint8).permute(0, 3, 1, 2).contiguous().float()
-    return video_t
+def _to_torch_tchw(video_thwc_uint8: np.ndarray) -> torch.Tensor:
+    """
+    Convert (T,H,W,3) uint8 -> torch float (T,3,H,W)
+    """
+    return torch.from_numpy(video_thwc_uint8).permute(0, 3, 1, 2).contiguous().float()
 
-def to_uint8_contrast(video16, p_low=1, p_high=99.8):
-    v = video16.astype(np.float32)
+
+def to_uint8_contrast(video_any, p_low=1.0, p_high=99.8) -> np.ndarray:
+    """
+    Percentile contrast stretch to uint8.
+    Works for (T,H,W) or (H,W).
+    """
+    v = np.asarray(video_any).astype(np.float32)
     lo, hi = np.percentile(v, (p_low, p_high))
     v = np.clip((v - lo) / (hi - lo + 1e-6), 0, 1)
     return (v * 255).astype(np.uint8)
 
-def load_hdf5(h5_path, dataset_path, frames: int = None, resize=True, size=(256, 256)):
+
+# -----------------------------
+# Loading
+# -----------------------------
+def load_hdf5(h5_path: str, dataset_path: str, frames: int | None = None, resize=True, size_wh=(256, 256)) -> torch.Tensor:
+    """
+    Load HDF5 dataset into torch (T,3,H,W) float.
+
+    Expects dataset to be (T,H,W) or (T,H,W,C). Non-uint8 is contrast-stretched.
+    """
     h5_path = Path(h5_path)
     if not h5_path.exists():
         raise FileNotFoundError(f"File not found: {h5_path}")
@@ -105,265 +158,202 @@ def load_hdf5(h5_path, dataset_path, frames: int = None, resize=True, size=(256,
         if dataset_path not in h5:
             raise KeyError(f"Dataset '{dataset_path}' not found in file.")
         ds = h5[dataset_path]
-        if frames is not None:
-            video = np.array(ds[:frames])
-        else:
-            video = np.array(ds[:])
+        video = np.array(ds[:frames] if frames is not None else ds[:])
 
-    # video should be (T,H,W) typically
-    if video.ndim == 2:
+    if video.ndim == 2:  # (H,W)
         video = video[None, ...]
 
-    # if uint16 etc -> contrast to uint8
+    # If not uint8, stretch to uint8
     if video.dtype != np.uint8:
         video = to_uint8_contrast(video)
 
-    v_thwc = _ensure_3ch_uint8(video)
-    v_thwc = _maybe_resize_video_THWC(v_thwc, resize=resize, size=size)
-    return _to_torch_TCHW(v_thwc)
+    v_thwc = _ensure_thwc_rgb_uint8(video)          # (T,H,W,3) uint8
+    v_thwc = _resize_video_thwc(v_thwc, resize, size_wh)
+    return _to_torch_tchw(v_thwc)
 
-def load_tiff(path, frames: int = None, resize: bool = True, size=(256, 256)):
+
+def load_tiff(path: str, frames: int | None = None, resize=True, size_wh=(256, 256)) -> torch.Tensor:
+    """
+    Load TIFF stack into torch (T,3,H,W) float.
+    """
     mm = tifffile.memmap(path)
 
     if mm.ndim == 3:
-        T = min(int(frames), mm.shape[0]) if frames is not None else mm.shape[0]
+        T = int(mm.shape[0]) if frames is None else min(int(frames), int(mm.shape[0]))
         video = np.ascontiguousarray(mm[:T])
     elif mm.ndim == 2:
         video = np.ascontiguousarray(mm[None, ...])
     else:
-        raise ValueError(f"Unsupported TIFF ndim={mm.ndim} with shape={mm.shape}")
+        raise ValueError(f"Unsupported TIFF ndim={mm.ndim} shape={mm.shape}")
 
     if not video.dtype.isnative:
         video = video.astype(video.dtype.type)
 
-    # contrast to uint8 (T,H,W)
-    v_u8 = to_uint8_contrast(video)
+    v_u8 = to_uint8_contrast(video)                 # (T,H,W) uint8
+    v_thwc = _ensure_thwc_rgb_uint8(v_u8)           # (T,H,W,3)
+    v_thwc = _resize_video_thwc(v_thwc, resize, size_wh)
+    return _to_torch_tchw(v_thwc)
 
-    # -> (T,H,W,3)
-    v_thwc = _ensure_3ch_uint8(v_u8)
 
-    # optional resize
-    v_thwc = _maybe_resize_video_THWC(v_thwc, resize=resize, size=size)
-
-    # Returns already the correct shape...
-    return _to_torch_TCHW(v_thwc)
-
-def load_video(file: str, resize: bool = True, size=(256, 256), max_frames: int = None):
+def load_video(file: str, resize=True, size_wh=(256, 256), max_frames: int | None = None) -> torch.Tensor:
     """
-    Load a video from the given file path and return a torch tensor (T, C, H, W).
+    Load a video file into torch (T,3,H,W) float.
 
-    Args:
-        file: Path to the video file.
-        resize: If True, resize frames to `size`.
-        size: (W, H) target size for cv2.resize.
-        max_frames: Limit number of frames loaded/returned.
-
-    Returns:
-        video: torch.FloatTensor of shape (T, C, H, W)
+    read_video_from_path typically returns frames as (H,W,C) or (H,W).
     """
-    video = read_video_from_path(file)  # expected iterable/list/array of frames (H,W,C) or (H,W)
+    video = read_video_from_path(file)
     if video is None or len(video) == 0:
         raise ValueError(f"No frames read from: {file}")
 
-    # optionally cap early to avoid unnecessary work
     if max_frames is not None:
-        video = video[:max_frames]
+        video = video[: int(max_frames)]
 
     frames = []
     for frame in video:
         f = np.asarray(frame)
-
-        # ensure 3 channels (H,W,3)
-        if f.ndim == 2:  # grayscale
+        if f.ndim == 2:
             f = cv2.cvtColor(f, cv2.COLOR_GRAY2RGB)
-        elif f.ndim == 3 and f.shape[2] == 4:  # RGBA -> RGB
+        elif f.ndim == 3 and f.shape[2] == 4:
             f = f[..., :3]
 
         if resize:
-            f = cv2.resize(f, size)  # size is (W,H) in OpenCV
+            target_w, target_h = int(size_wh[0]), int(size_wh[1])
+            f = cv2.resize(f, (target_w, target_h), interpolation=cv2.INTER_AREA)
 
         frames.append(f)
 
-    video_np = np.ascontiguousarray(np.stack(frames, axis=0))  # (T,H,W,C)
-    video_t = torch.from_numpy(video_np).permute(0, 3, 1, 2).float()  # (T,C,H,W)
+    v_thwc = np.ascontiguousarray(np.stack(frames, axis=0)).astype(np.uint8, copy=False)  # (T,H,W,3)
+    return _to_torch_tchw(v_thwc)
 
-    return video_t
 
-def save_and_display_video(array, filename='output.mp4', fps=30):
-    num_frames, height, width = array.shape
+# -----------------------------
+# Saving
+# -----------------------------
+def save_and_display_video(array: np.ndarray, filename="output.mp4", fps=30) -> None:
+    """
+    Save grayscale or RGB video to MP4.
 
-    # Normalize and convert to uint8 if needed
-    if array.dtype != np.uint8:
-        array_min = array.min()
-        array_max = array.max()
-        array = 255 * (array - array_min) / (array_max - array_min + 1e-8)
-        array = np.clip(array, 0, 255).astype(np.uint8)
+    Accepts:
+      - (T,H,W) grayscale
+      - (T,H,W,3) RGB
+    """
+    v = np.asarray(array)
 
-    # VideoWriter setup
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(filename, fourcc, fps, (width, height), isColor=True)
+    if v.ndim == 3:
+        # (T,H,W) -> (T,H,W,3)
+        if v.dtype != np.uint8:
+            vmin, vmax = float(np.min(v)), float(np.max(v))
+            v = 255.0 * (v - vmin) / (vmax - vmin + 1e-8)
+            v = np.clip(v, 0, 255).astype(np.uint8)
+        v = np.repeat(v[..., None], 3, axis=-1)
 
-    for i in range(num_frames):
-        frame = array[i]
-        # Check if frame is already 3-channel (RGB) or needs conversion from grayscale
-        if frame.ndim == 2:
-            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
-        elif frame.ndim == 3:
-            if frame.shape[2] == 3:
-                # RGB to BGR for OpenCV
-                frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            else:
-                # Fallback or other channel counts
-                frame_bgr = frame
-        else:
-            frame_bgr = frame
-            
-        out.write(frame_bgr)
+    elif v.ndim == 4 and v.shape[-1] == 3:
+        if v.dtype != np.uint8:
+            v = np.clip(v, 0, 255).astype(np.uint8)
+    else:
+        raise ValueError(f"Unsupported array shape for save_and_display_video: {v.shape}")
+
+    T, H, W, _ = v.shape
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    out = cv2.VideoWriter(filename, fourcc, fps, (W, H), isColor=True)
+
+    for i in range(T):
+        # v is RGB -> convert to BGR for OpenCV
+        out.write(cv2.cvtColor(v[i], cv2.COLOR_RGB2BGR))
 
     out.release()
     print(f"Video saved to {filename}")
 
 
-def save_video_tiff(video, filename):
+def save_video_tiff(video, filename: str) -> None:
     """
     Save video as TIFF stack.
-    video: (T, H, W, 3) or (T, C, H, W)
+    Accepts:
+      - (T,H,W,3) or (T,H,W)
+      - (T,C,H,W) torch/numpy
     """
-    v = np.asarray(video)
-    
-    # Handle tensor
-    if isinstance(video, torch.Tensor):
-        v = video.detach().cpu().numpy()
-        
-    # Standardize to (T, H, W, C)
-    if v.ndim == 4 and v.shape[1] in [1, 3]:  # (T, C, H, W)
+    v = video.detach().cpu().numpy() if isinstance(video, torch.Tensor) else np.asarray(video)
+
+    if v.ndim == 4 and v.shape[1] in (1, 3):  # (T,C,H,W) -> (T,H,W,C)
         v = np.transpose(v, (0, 2, 3, 1))
-        
-    # Handle single channel
+
     if v.ndim == 4 and v.shape[-1] == 1:
-        v = v.squeeze(-1)
-        
-    # Ensure uint8
+        v = v[..., 0]  # (T,H,W)
+
     if v.dtype != np.uint8:
-        if v.max() <= 1.0:
-            v = (v * 255).astype(np.uint8)
+        if np.max(v) <= 1.0:
+            v = (v * 255.0).astype(np.uint8)
         else:
-            v = v.astype(np.uint8)
-            
-    try:
-        tifffile.imwrite(filename, v, photometric='rgb' if v.ndim==4 and v.shape[-1]==3 else 'minisblack')
-        print(f"TIFF saved to {filename}")
-    except Exception as e:
-        print(f"Error saving TIFF: {e}")
-        raise e
+            v = np.clip(v, 0, 255).astype(np.uint8)
+
+    photometric = "rgb" if (v.ndim == 4 and v.shape[-1] == 3) else "minisblack"
+    tifffile.imwrite(filename, v, photometric=photometric)
+    print(f"TIFF saved to {filename}")
 
 
-def save_video_hdf5(video, filename):
+def save_video_hdf5(video, filename: str) -> None:
     """
-    Save video as HDF5 file.
-    video: (T, H, W, 3) or (T, C, H, W)
+    Save video as HDF5 dataset '/data' with gzip compression.
+    Accepts:
+      - (T,H,W,3) or (T,H,W)
+      - (T,C,H,W) torch/numpy
     """
-    v = np.asarray(video)
-    
-    # Handle tensor
-    if isinstance(video, torch.Tensor):
-        v = video.detach().cpu().numpy()
-        
-    # Standardize to (T, H, W, C)
-    if v.ndim == 4 and v.shape[1] in [1, 3]:  # (T, C, H, W)
+    v = video.detach().cpu().numpy() if isinstance(video, torch.Tensor) else np.asarray(video)
+
+    if v.ndim == 4 and v.shape[1] in (1, 3):  # (T,C,H,W) -> (T,H,W,C)
         v = np.transpose(v, (0, 2, 3, 1))
-        
-    # Ensure uint8
+
     if v.dtype != np.uint8:
-        if v.max() <= 1.0:
-            v = (v * 255).astype(np.uint8)
+        if np.max(v) <= 1.0:
+            v = (v * 255.0).astype(np.uint8)
         else:
-            v = v.astype(np.uint8)
-            
-    try:
-        with h5py.File(filename, 'w') as f:
-            # Create dataset with compression
-            f.create_dataset('data', data=v, compression='gzip', compression_opts=9)
-        print(f"HDF5 saved to {filename}")
-    except Exception as e:
-        print(f"Error saving HDF5: {e}")
-        raise e
+            v = np.clip(v, 0, 255).astype(np.uint8)
 
-def _to_gray_u8_frame(frame):
+    with h5py.File(filename, "w") as f:
+        f.create_dataset("data", data=v, compression="gzip", compression_opts=9)
+    print(f"HDF5 saved to {filename}")
+
+
+# -----------------------------
+# SSIM
+# -----------------------------
+def _to_gray_float(video) -> np.ndarray:
     """
-    frame: torch or np, can be (C,H,W), (H,W,C), (H,W).
-    Returns uint8 (H,W) with robust scaling using percentiles of that frame.
+    Convert video to grayscale float32 array shaped (T,H,W).
+    Accepts (T,C,H,W), (T,H,W,C), (T,H,W).
+    Uses first channel if multi-channel.
     """
-    a = frame
-    if isinstance(a, torch.Tensor):
-        a = a.detach().cpu().numpy()
-    a = np.asarray(a)
+    v = video.detach().cpu().numpy() if isinstance(video, torch.Tensor) else np.asarray(video)
 
-    if a.ndim == 3 and a.shape[0] in (1,3):  # (C,H,W)
-        a = a[0]
-    elif a.ndim == 3 and a.shape[-1] in (3,4):  # (H,W,C)
-        a = a[..., 0]
-    elif a.ndim != 2:
-        raise ValueError(f"Unsupported frame shape for gray: {a.shape}")
-
-    a = a.astype(np.float32)
-    finite = np.isfinite(a)
-    if finite.any():
-        lo = float(np.percentile(a[finite], 1))
-        hi = float(np.percentile(a[finite], 99))
-        if hi <= lo:
-            hi = lo + 1.0
-        a = (a - lo) / (hi - lo) * 255.0
-    else:
-        a[:] = 0.0
-    return np.clip(a, 0, 255).astype(np.uint8)
-
-
-# def ssim2d_u8(img1_u8, img2_u8, sigma=1.5):
-#     x = img1_u8.astype(np.float32)
-#     y = img2_u8.astype(np.float32)
-
-#     C1 = (0.01 * 255) ** 2
-#     C2 = (0.03 * 255) ** 2
-
-#     mu_x = cv2.GaussianBlur(x, (0, 0), sigma)
-#     mu_y = cv2.GaussianBlur(y, (0, 0), sigma)
-
-#     mu_x2 = mu_x * mu_x
-#     mu_y2 = mu_y * mu_y
-#     mu_xy = mu_x * mu_y
-
-#     sig_x2 = cv2.GaussianBlur(x * x, (0, 0), sigma) - mu_x2
-#     sig_y2 = cv2.GaussianBlur(y * y, (0, 0), sigma) - mu_y2
-#     sig_xy = cv2.GaussianBlur(x * y, (0, 0), sigma) - mu_xy
-
-#     num = (2 * mu_xy + C1) * (2 * sig_xy + C2)
-#     den = (mu_x2 + mu_y2 + C1) * (sig_x2 + sig_y2 + C2)
-#     ssim_map = num / (den + 1e-12)
-#     return float(np.mean(ssim_map)), ssim_map
-
-
-def video_ssim_score(video, mode="ref_first"):
-    v = video
-    if isinstance(v, torch.Tensor):
-        v = v.detach().cpu().numpy()
-    v = np.asarray(v)
-
-    # Convert to grayscale float32 frames WITHOUT per-frame normalization
-    if v.ndim == 4 and v.shape[1] in (1, 3):       # (T,C,H,W)
-        gray = v[:, 0].astype(np.float32) if v.shape[1] == 1 else v[:, 0].astype(np.float32)  # or proper RGB->gray if needed
-    elif v.ndim == 4 and v.shape[-1] in (3, 4):    # (T,H,W,C)
-        gray = v[..., 0].astype(np.float32)        # or proper RGB->gray
-    elif v.ndim == 3:                               # (T,H,W)
+    if v.ndim == 4 and v.shape[1] in (1, 3):          # (T,C,H,W)
+        gray = v[:, 0].astype(np.float32)
+    elif v.ndim == 4 and v.shape[-1] in (3, 4):       # (T,H,W,C)
+        gray = v[..., 0].astype(np.float32)
+    elif v.ndim == 3:                                 # (T,H,W)
         gray = v.astype(np.float32)
     else:
-        raise ValueError(f"Unsupported video shape for SSIM: {v.shape}")
+        raise ValueError(f"Unsupported video shape for gray conversion: {v.shape}")
 
-    T = gray.shape[0]
+    return gray
+
+
+def video_ssim_score(video, mode="ref_first") -> float:
+    """
+    Compute mean SSIM over a video.
+
+    mode:
+      - "ref_first": SSIM(frame[t], frame[0]) averaged over t=1..T-1
+      - "consecutive": SSIM(frame[t], frame[t-1]) averaged over t=1..T-1
+
+    Returns:
+        float in [0,1] (typically), higher is more similar.
+    """
+    gray = _to_gray_float(video)
+    T = int(gray.shape[0])
     if T < 2:
-        return 0.0
+        return 1.0
 
-    # Global scaling (same for all frames)
+    # global scaling for stable SSIM comparisons
     finite = np.isfinite(gray)
     lo = float(np.percentile(gray[finite], 1)) if finite.any() else 0.0
     hi = float(np.percentile(gray[finite], 99)) if finite.any() else 1.0
@@ -372,25 +362,43 @@ def video_ssim_score(video, mode="ref_first"):
 
     frames_u8 = np.clip((gray - lo) / (hi - lo) * 255.0, 0, 255).astype(np.uint8)
 
+    try:
+        from skimage.metrics import structural_similarity as ssim
+    except Exception:
+        # fallback: 1 - normalized L1 difference (crude but stable)
+        if mode == "ref_first":
+            ref = frames_u8[0].astype(np.float32)
+            diffs = [np.mean(np.abs(frames_u8[t].astype(np.float32) - ref)) for t in range(1, T)]
+        else:
+            diffs = [np.mean(np.abs(frames_u8[t].astype(np.float32) - frames_u8[t - 1].astype(np.float32))) for t in range(1, T)]
+        d = float(np.mean(diffs)) if diffs else 0.0
+        return float(np.clip(1.0 - d / 255.0, 0.0, 1.0))
+
+    scores = []
     if mode == "ref_first":
         ref = frames_u8[0]
-        scores = [(frames_u8[t]- ref) for t in range(1, T)]
-        return float(np.mean(scores)) if scores else 0.0
+        for t in range(1, T):
+            scores.append(ssim(ref, frames_u8[t], data_range=255))
+    else:
+        for t in range(1, T):
+            scores.append(ssim(frames_u8[t - 1], frames_u8[t], data_range=255))
 
-    # consecutive
-    scores = [(frames_u8[t] - frames_u8[t - 1]) for t in range(1, T)]
-    return float(np.mean(scores)) if scores else 0.0
+    return float(np.mean(scores)) if scores else 1.0
 
 
+# -----------------------------
+# Media probe
+# -----------------------------
 def probe_media_info(path: str):
     """
     Try to get (frames, width, height) without loading full data.
-    Works for: mp4/avi via cv2, tiff via tifffile (if available), h5 via h5py (if available).
-    Returns (frames, w, h) possibly None for unknown fields.
+    Supports:
+      - mp4/avi/mov/mkv via cv2
+      - tiff via tifffile
+      - h5/hdf5 via h5py (prefers /data)
     """
     ext = os.path.splitext(path)[1].lower()
 
-    # video container
     if ext in [".avi", ".mp4", ".mov", ".mkv"]:
         cap = cv2.VideoCapture(path)
         if not cap.isOpened():
@@ -404,33 +412,24 @@ def probe_media_info(path: str):
         h = int(h) if h and h > 0 else None
         return frames, w, h
 
-    # tiff stack
     if ext in [".tif", ".tiff"]:
         try:
-            import tifffile
             with tifffile.TiffFile(path) as tf:
                 pages = len(tf.pages)
-                # first page shape (H,W) or (H,W,C)
                 shp = tf.pages[0].shape
-                if len(shp) >= 2:
-                    h, w = int(shp[0]), int(shp[1])
-                else:
-                    h, w = None, None
+                h = int(shp[0]) if len(shp) >= 2 else None
+                w = int(shp[1]) if len(shp) >= 2 else None
             return int(pages) if pages else None, w, h
         except Exception:
             return None, None, None
 
-    # hdf5
     if ext in [".h5", ".hdf5"]:
         try:
-            import h5py
             with h5py.File(path, "r") as f:
-                dset = None
-                # prefer /data if present
                 if "/data" in f:
                     dset = f["/data"]
                 else:
-                    # pick first dataset found
+                    # find first dataset
                     def _first_dataset(g):
                         for k in g.keys():
                             obj = g[k]
@@ -441,14 +440,13 @@ def probe_media_info(path: str):
                                 if r is not None:
                                     return r
                         return None
+
                     dset = _first_dataset(f)
 
                 if dset is None:
                     return None, None, None
 
                 shp = dset.shape
-                # common layouts:
-                # (T,H,W) or (T,C,H,W)
                 frames = int(shp[0]) if len(shp) >= 1 else None
                 if len(shp) == 3:
                     h, w = int(shp[1]), int(shp[2])
@@ -456,6 +454,7 @@ def probe_media_info(path: str):
                     h, w = int(shp[-2]), int(shp[-1])
                 else:
                     h, w = None, None
+
             return frames, w, h
         except Exception:
             return None, None, None

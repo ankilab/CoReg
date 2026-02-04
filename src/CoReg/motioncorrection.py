@@ -27,6 +27,7 @@ class MotionCorrectionGUI(QMainWindow):
         screen = QApplication.primaryScreen()
         g = screen.availableGeometry()
         self._initial_zoom_done = False
+        self._auto_fit_done = False
 
         w = int(g.width() * 0.8)
         h = int(g.height() * 0.8)
@@ -331,15 +332,18 @@ class MotionCorrectionGUI(QMainWindow):
         pd_layout.addWidget(self.min_dist_spin)
         
         
-        self.rotate_btn = QPushButton("Rotate Input 90°")
+        self.rotate_btn = QPushButton("↻")
         self.rotate_btn.clicked.connect(self.rotate_input)
 
         second_bar.addWidget(self.sync_view_chk)   
-        pd_layout.addWidget(self.reset_zoom_btn)
-        pd_layout.addWidget(self.rotate_btn)
-        pd_layout.addWidget(self.clear_points_btn)
+        second_bar.addWidget(self.reset_zoom_btn)
+  
+        second_bar.addWidget(self.rotate_btn)
+        #second_bar.addWidget(self.clear_points_btn)
         #pd_layout.addWidget(self.undo_btn)
 
+
+        second_bar.addStretch(1)
         # Move close button to bottom
         pd_layout.removeWidget(self.param_dialog.close_btn)
         pd_layout.addWidget(self.param_dialog.close_btn)
@@ -1154,6 +1158,7 @@ class MotionCorrectionGUI(QMainWindow):
 
 
     def load_data(self, load_settings=None):
+        self._auto_fit_done = False
         if not self.video_path:
             return
 
@@ -1282,8 +1287,9 @@ class MotionCorrectionGUI(QMainWindow):
             self.video_data = None
             return
 
+
         # -----------------------------
-        # 4) Your correlation code (unchanged)
+        # 4) Diff-to-first-frame code
         # -----------------------------
         try:
             gray_full = self._get_gray_video_np()  # (T, H, W)
@@ -1291,6 +1297,7 @@ class MotionCorrectionGUI(QMainWindow):
             T, H, W = gray_full.shape
             target_dim = 64
             scale = min(target_dim / H, target_dim / W)
+
             if scale < 1.0:
                 dsize = (int(W * scale), int(H * scale))
                 gray_small = []
@@ -1300,29 +1307,40 @@ class MotionCorrectionGUI(QMainWindow):
             else:
                 gray_small = gray_full
 
+            # Flatten each frame -> (T, D)
             flat = gray_small.reshape(T, -1).astype(np.float32)
+
+            # Normalize per-frame (mean/std) like before (optional, but keeps behavior comparable)
             means = flat.mean(axis=1, keepdims=True)
             stds = flat.std(axis=1, keepdims=True) + 1e-6
             flat_norm = (flat - means) / stds
 
-            if T > 1:
-                diffs = flat_norm[1:] - flat_norm[:-1]
-                l2_norms = np.linalg.norm(diffs, axis=1)
+            if T > 0:
+                # ---- THIS IS THE CHANGE ----
+                # Diff of each frame to the first frame (t - 0)
+                ref = flat_norm[0:1]              # (1, D)
+                diffs = flat_norm - ref           # (T, D)
+                l2_norms = np.linalg.norm(diffs, axis=1)  # (T,)
 
-                max_val = l2_norms.max()
+                # Normalize to [0, 1] for plotting
+                max_val = float(l2_norms.max()) if l2_norms.size else 0.0
                 if max_val > 1e-6:
-                    scores = l2_norms / max_val
+                    scores = (l2_norms / max_val).astype(np.float32)
                 else:
-                    scores = np.zeros_like(l2_norms)
+                    scores = np.zeros((T,), dtype=np.float32)
 
-                scores = np.concatenate([[0.0], scores])
+                # Ensure frame 0 is exactly 0
+                scores[0] = 0.0
+
                 self.motion_plot.set_data(scores)
             else:
-                self.motion_plot.set_data([0.0])
+                self.motion_plot.set_data([])
 
         except Exception as e:
-            print(f"Error calculating correlation: {e}")
+            print(f"Error calculating diff-to-first-frame: {e}")
             self.motion_plot.set_data([])
+
+
 
 
 
@@ -1776,8 +1794,11 @@ class MotionCorrectionGUI(QMainWindow):
 
             
             # ensure view includes outside points too (use full ptsA, not just pts_show)
-            if not (self.edit_points_mode or self.edit_tracks_mode):
+            if (not self.edit_points_mode and not self.edit_tracks_mode
+                and not self.is_playing
+                and not getattr(self, "_auto_fit_done", False)):
                 panel.fit_view_to_image_and_points(ptsA, margin=20)
+                self._auto_fit_done = True
 
             # draw trajectories ONLY here
             panel.set_trajectories(tr, idx, trail=15)
@@ -2263,6 +2284,7 @@ class MotionCorrectionGUI(QMainWindow):
 
 
     def on_edit_modes_changed(self, *_):
+        self._auto_fit_done = False
         self.edit_points_mode = self.edit_points_btn.isChecked()
         self.edit_tracks_mode = self.edit_tracks_btn.isChecked()
 
@@ -2305,6 +2327,7 @@ class MotionCorrectionGUI(QMainWindow):
 
 
     def on_processing_finished(self, pred_tracks, pred_visibility, pred_confidence, grid_pts, warped_video, disp_field):
+        self._auto_fit_done = False
         if pred_tracks is None and warped_video is not None:
             method = getattr(self.worker, "method", "ANTs")
             if method == "LDDMM":
@@ -2794,29 +2817,55 @@ class MotionCorrectionGUI(QMainWindow):
     def rotate_input(self, checked=False):
         if self.video_data is None:
             return
-        try:          
-            # Let's do 90 deg clockwise (standard "rotate")
-            self.video_data = torch.rot90(self.video_data, k=-1, dims=[2, 3])
-            
-            # Update T, H, W (though T doesn't change)
+
+        try:
+            # 90° clockwise: (T,C,H,W) rotate over H,W dims
+            self.video_data = torch.rot90(self.video_data, k=-1, dims=(2, 3))
+
+            # Update frame count (T unchanged, but safe)
             self.total_frames = int(self.video_data.shape[0])
-            
-            # Clear everything that depends on coordinates
-            self.clear_all_data(keep_video=True) 
-            
-            # Clear manual points too
-            self.custom_points = []
-            self.custom_crosses = []
-            self.points_label.setText(f"Points: 0")
 
-            self.apply_point_preset()
+            # Keep current_frame in range
+            self.current_frame = int(np.clip(self.current_frame, 0, self.total_frames - 1))
+            self.slider.blockSignals(True)
+            self.slider.setRange(0, self.total_frames - 1)
+            self.slider.setValue(self.current_frame)
+            self.slider.blockSignals(False)
 
+            # Invalidate cached visualizations that depend on orientation
+            if isinstance(self.viz_data, dict):
+                self.viz_data.pop("input", None)
+                self.viz_data.pop("warped", None)  # warped no longer valid after rotation
+                # remove any cached filtered videos
+                for k in list(self.viz_data.keys()):
+                    if k.startswith("filtered_video::"):
+                        self.viz_data.pop(k, None)
+
+            # Also invalidate results that no longer match coordinates
+            self.pred_tracks = None
+            self.pred_visibility = None
+            self.pred_confidence = None
+            self.grid_pts = None
+            self.warped_video = None
+            self.disp_field = None
+            self.ants_video = None
+            self.lddmm_video = None
+            self.track_active = None
+            self.selected_track_idx = None
+            self.edit_tracks_btn.setEnabled(False)
+            self.edit_tracks_btn.setChecked(False)
+
+            # IMPORTANT: do NOT call clear_all_data(), do NOT apply_point_preset()
+            # Just redraw once — update_plot renders BOTH panels.
             self.status_label.setText("Input video rotated 90° clockwise")
             self.update_plot()
-            self.reset_all_zoom()
+
+            # Optional: only reset zoom if you WANT it
+            # self.reset_all_zoom()
 
         except Exception as e:
             self.status_label.setText(f"Error rotating: {e}")
+
 
     def _get_video_input_for_tracking(self):
         """

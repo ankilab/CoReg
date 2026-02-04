@@ -213,7 +213,7 @@ class ProcessingWorker(QThread):
                             q = q.unsqueeze(0)
                         queries = q
                     else:
-                        raise ValueError("No query points provided for tracking.")
+                        raise ValueError("No new query points provided for tracking.")
 
                 if isinstance(queries, np.ndarray):
                     queries = torch.from_numpy(queries)
