@@ -332,7 +332,7 @@ class MotionCorrectionGUI(QMainWindow):
         pd_layout.addWidget(self.min_dist_spin)
         
         
-        self.rotate_btn = QPushButton("↻")
+        self.rotate_btn = QPushButton("↻ Rotate")
         self.rotate_btn.clicked.connect(self.rotate_input)
 
         second_bar.addWidget(self.sync_view_chk)   
@@ -341,7 +341,8 @@ class MotionCorrectionGUI(QMainWindow):
         second_bar.addWidget(self.rotate_btn)
         #second_bar.addWidget(self.clear_points_btn)
         #pd_layout.addWidget(self.undo_btn)
-
+        second_bar.addWidget(QLabel("DF σ:"))
+        second_bar.addWidget(self.df_sigma_spin)
 
         second_bar.addStretch(1)
         # Move close button to bottom
@@ -1608,8 +1609,6 @@ class MotionCorrectionGUI(QMainWindow):
                     self.viz_data['tracks'][self.current_frame, idx] = (float(x), float(y))
 
                 self.update_plot()
-
-                # <<< ADD THIS >>>
                 self._schedule_recalc_warping(delay_ms=3000)
 
             return
@@ -2020,16 +2019,18 @@ class MotionCorrectionGUI(QMainWindow):
             self.rotate_btn.setEnabled(True)
             return
 
-        # -------------------------------
-        # Start worker
-        # -------------------------------
+        ### Start worker ###
+        sigma = float(self.df_sigma_spin.value()) if hasattr(self, "df_sigma_spin") else 3.0
+
         self.worker = ProcessingWorker(
             video_input,
             parent=self,
             existing_data=existing_data,
             method=method,
-            queries=new_queries
+            queries=new_queries,
+            df_sigma=sigma,   # <-- IMPORTANT
         )
+
 
         # your worker expects new_queries in custom_grid_pts sometimes:
         if new_queries is not None:
@@ -2111,7 +2112,17 @@ class MotionCorrectionGUI(QMainWindow):
             except Exception:
                 pass
 
-        self.worker = ProcessingWorker(video_input, base_grid_tensor, tracks=tracks_t, parent=self, filter_name=None)
+        sigma = float(self.df_sigma_spin.value()) if hasattr(self, "df_sigma_spin") else 3.0
+
+        self.worker = ProcessingWorker(
+            video_input,
+            base_grid_tensor,
+            tracks=tracks_t,
+            parent=self,
+            filter_name=None,
+            df_sigma=sigma,   # <-- IMPORTANT
+        )
+
         self.worker.tracks_ready.connect(self.on_tracks_ready)
         self.worker.finished.connect(self.on_processing_finished)
         self.worker.error.connect(self.on_processing_error)
