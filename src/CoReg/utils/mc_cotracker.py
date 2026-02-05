@@ -1,20 +1,15 @@
+import gc
+import math
 import os
-import numpy as np
+
 import cv2
+import numpy as np
 import torch
 import torch.nn.functional as F
-from scipy.ndimage import zoom
 from scipy.interpolate import griddata
 from scipy.ndimage import map_coordinates
-import math
-from IPython.display import Video, display
-from scipy.interpolate import RBFInterpolator
-from scipy.ndimage import gaussian_filter
 
-
-
-#tried to clear memory because of OOM errors
-import gc
+# Memory cleanup to prevent OOM errors
 torch.cuda.empty_cache()
 gc.collect()
 
@@ -22,17 +17,14 @@ gc.collect()
 
 
 def cotrack_model(video, queries, device, grid_size=0):
-    """"Run the CoTracker model on the provided video and grid points.
-    Model defines which cotracker model is used for tracking.
-    args:
-        video (torch.Tensor): A tensor containing the video frames.
-        grid_size (int): The size of the grid for tracking.
-        points_x (list): List of x-coordinates for reference points.
-        points_y (list): List of y-coordinates for reference points.
-    returns:
-        pred_tracks (torch.Tensor): Predicted tracks from the model.
-        pred_visibility (torch.Tensor): Predicted visibility from the model.
-        grid_pts (torch.Tensor): Points on the grid used for tracking.
+    """
+    Run the CoTracker model on the provided video and grid points.
+
+    :param video: (T, C, H, W) video tensor.
+    :param queries: (1, N, 2) query points or None.
+    :param device: torch device.
+    :param grid_size: Grid size for automatic point generation (if queries is None).
+    :return: (pred_tracks, pred_visibility)
     """
 
     import os
@@ -56,9 +48,9 @@ def cotrack_model(video, queries, device, grid_size=0):
 
 def _crop_or_pad_phi_to_hw(phi_2hw: np.ndarray, H: int, W: int) -> np.ndarray:
     """
-    phi_2hw: (2,h,w) -> (2,H,W)
-    - wenn größer: crop auf (H,W)
-    - wenn kleiner: pad rechts/unten mit edge (letzter Wert am Rand)
+    Resize a deformation field phi_2hw (2, h, w) to target size (2, H, W).
+    - If larger: crop to (H, W).
+    - If smaller: pad with edge replication.
     """
     phi = np.asarray(phi_2hw, dtype=np.float32)
     if phi.ndim != 3 or phi.shape[0] != 2:
@@ -80,20 +72,19 @@ def _crop_or_pad_phi_to_hw(phi_2hw: np.ndarray, H: int, W: int) -> np.ndarray:
 
 
 def gaussian_smooth(u, sigma=2.0):
-    # u: (H,W) float32
+    """Apply Gaussian smoothing to a 2D array."""
     return cv2.GaussianBlur(u.astype(np.float32, copy=False), (0, 0), float(sigma))
     
 
-def warping(predicted_tracks, frames, smoothing=3,
-            callback=None):
+def warping(predicted_tracks, frames, smoothing=3, callback=None):
     """
-    predicted_tracks: (B, T, G, 2)
-    frames: torch or np, shape (T, C, H, W) or (T, H, W, C)
-    callback: function(float), optional callback for progress (0..1)
+    Apply motion correction by warping frames according to predicted tracks.
 
-    Returns:
-        warpeds: (T, H, W) float32 (channel-0)
-        phis:    (T-1, H, W, 2) float32  displacement field (dx,dy) from frame0 -> frame i
+    :param predicted_tracks: (B, T, G, 2) array of point tracks.
+    :param frames: (T, C, H, W) or (T, H, W, C) video data.
+    :param smoothing: Sigma for Gaussian smoothing of the displacement field.
+    :param callback: Optional function(float) for progress reporting.
+    :return: (warped_frames, displacement_fields)
     """
 
     # ---- to numpy ----
@@ -140,8 +131,8 @@ def warping(predicted_tracks, frames, smoothing=3,
         raise ValueError(f"frames has {T_orig} frames but predicted_tracks has only {T} timesteps")
 
     sigma = float(smoothing) if smoothing is not None else 0.0
-    do_smooth = sigma > 0.0
 
+    # Tracks for frame 0 (reference)
     sparse_x = tracks[0, :, :, 0]  # (T, G)
     sparse_y = tracks[0, :, :, 1]  # (T, G)
     disp_sparse = tracks[0] - tracks[0, 0]  # (T, G, 2)

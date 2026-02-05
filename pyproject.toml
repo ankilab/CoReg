@@ -35,3 +35,21 @@ include = ["cotracker*", "utils*"]
 
 [project.scripts]
 coreg-gui = "gui:main"
+
+[tool.black]
+line-length = 88
+target-version = ['py310']
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | _build
+  | buck-out
+  | build
+  | dist
+)/
+'''

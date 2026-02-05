@@ -1,51 +1,39 @@
 import os
-import torch
-import numpy as np
-from cotracker.utils.visualizer import read_video_from_path
-import matplotlib.pyplot as plt
-from scipy.ndimage import map_coordinates
-from skimage.metrics import structural_similarity as ssim
-#  Visualization
-import matplotlib.pyplot as plt
-import cv2
 
-from scipy.ndimage import gaussian_filter, zoom
-import numpy as np
-import torch.nn.functional as F
-import utils.torch_lddmm as torch_lddmm
 import ants
-from PIL import Image
+import cv2
+import numpy as np
+import torch
+import torch.nn.functional as F
+from cotracker.utils.visualizer import read_video_from_path
+from scipy.ndimage import map_coordinates
+
+import utils.torch_lddmm as torch_lddmm
 
 
-def load_video(file, size=(256,256)):
+def load_video(file, size=(256, 256)):
     """
-    Load a video from the given file path, resize it to the specified size,
-    and return the video tensor and frames. 
-    args:
-        file (str): Path to the video file.
-        size (tuple): Desired size for the video frames (width, height).
-    returns:
-        video (torch.Tensor): A tensor containing the video frames, resized to the specified size.
-        video_frames (list): A list of resized video frames as numpy arrays.
+    Load and resize a video for LDDMM processing.
+
+    :param file: Path to the video file.
+    :param size: (width, height) tuple for resizing.
+    :return: (video_tensor, video_frames_list)
     """
-    video_path = file
-    video = read_video_from_path(video_path)
+    video = read_video_from_path(file)
     video_frames = [cv2.resize(frame, size) for frame in video]
-    video = torch.from_numpy(video).permute(0, 3, 1, 2).float()
-    
-    video = F.interpolate(video, size=size, mode='bilinear', align_corners=False)[None]
+    video_tensor = torch.from_numpy(video).permute(0, 3, 1, 2).float()
+    video_tensor = F.interpolate(
+        video_tensor, size=size, mode="bilinear", align_corners=False
+    )[None]
 
-    return video, video_frames
+    return video_tensor, video_frames
 
 def integrate_field(v, num_steps=10):
     """
-    Forward integrate the velocity field v(x,t) over [0,1] in small timesteps.
-    For simplicity, we treat v as constant in time (Euler integration in time).
-    v.shape = (2, H, W)
-
-    Returns a deformation field phi, where
-        phi[0] = x-coordinates of the final transformation
-        phi[1] = y-coordinates of the final transformation
+    Forward-integrate a velocity field v(x,t) over [0,1].
+    :param v: (2, H, W) velocity field.
+    :param num_steps: Number of integration steps.
+    :return: (2, H, W) deformation field phi.
     """
     # Basic coordinate grid
     _, H, W = v.shape
@@ -66,22 +54,29 @@ def integrate_field(v, num_steps=10):
     return np.stack([phi_x, phi_y], axis=0)
 
 def register_lddmm(fixed, moving):
+    """
+    Compute LDDMM registration between two frames.
+    :param fixed: Reference/target frame.
+    :param moving: Source/template frame.
+    :return: Warped numpy array.
+    """
     
-    lddmm = torch_lddmm.LDDMM(template=[moving],
-                          target=[fixed],
-                          #outdir='../notebook/',
-                          do_affine=0,
-                          do_lddmm=1,
-                          a=7,
-                          nt=5,
-                          niter=200,
-                          epsilon=4e0,
-                          sigma=20.0,
-                          sigmaR=40.0,
-                          optimizer='gdr',
-                          gpu_number=0,
-                          verbose=False,
-                      dx=None)
+    lddmm = torch_lddmm.LDDMM(
+        template=[moving],
+        target=[fixed],
+        do_affine=0,
+        do_lddmm=1,
+        a=7,
+        nt=5,
+        niter=200,
+        epsilon=4e0,
+        sigma=20.0,
+        sigmaR=40.0,
+        optimizer="gdr",
+        gpu_number=0,
+        verbose=False,
+        dx=None
+    )
     
     
 
@@ -89,6 +84,11 @@ def register_lddmm(fixed, moving):
     return lddmm.outputDeformedTemplate()[0]
 
 def lddmm_registration(frames):
+    """
+    Perform LDDMM registration on a sequence of frames, using frame 0 as reference.
+    :param frames: List or array of frames.
+    :return: List of warped numpy arrays.
+    """
     lddmm_registrations = [frames[0]]
     for i in range(1,len(frames)):
         reg = register_lddmm(frames[0], frames[i])
@@ -96,7 +96,8 @@ def lddmm_registration(frames):
     
     return lddmm_registrations
 
-def save_and_display_video(array, filename='output.mp4', fps=30):
+def save_and_display_video(array, filename="output.mp4", fps=30):
+    """Save a grayscale registration result to MP4."""
 
     if len(array.shape) >= 3:
         array = array[..., 0]  # Assuming the last dimension is color channels, take the first channel

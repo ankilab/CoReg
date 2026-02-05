@@ -1,24 +1,27 @@
 import sys
-import os
 import cv2
 import numpy as np
 import torch
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QPushButton, QSlider, QLabel, QVBoxLayout, QHBoxLayout,
-    QFileDialog, QLineEdit, QCheckBox, QGridLayout, QComboBox, QSpinBox, QSizePolicy, QProgressBar, QDialog,
-    QGraphicsRectItem, QDoubleSpinBox, QScrollArea, QMessageBox
+    QFileDialog, QLineEdit, QCheckBox, QGridLayout, QComboBox, QSpinBox, QSizePolicy, QProgressBar,
+    QDialog, QGraphicsRectItem, QDoubleSpinBox, QScrollArea, QMessageBox
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QThread, QElapsedTimer
 from PyQt6.QtGui import QImage, QPixmap, QPainter, QColor, QPalette
 import pyqtgraph as pg
+
+# Local imports
 from utils.mc_cotracker import cotrack_model, warping
-pg.setConfigOptions(imageAxisOrder='row-major')  # damit (H,W) wie numpy angezeigt wird
-import math
-import torch.nn.functional as F
+
+# Configure pyqtgraph to use row-major ordering (matching numpy)
+pg.setConfigOptions(imageAxisOrder='row-major')
+
 try:
     import ants
 except ImportError:
     ants = None
+
 try:
     import utils.torch_lddmm as torch_lddmm
 except ImportError:
@@ -30,13 +33,21 @@ DEFAULT_DEVICE = (
 
 
 class ProcessingWorker(QThread):
-    # tracks, visibility, confidence, grid
-    tracks_ready = pyqtSignal(object, object, object, object)
-    progress = pyqtSignal(int)
-    status_update = pyqtSignal(str)
-    # tracks_np, visibility, confidence, grid, warped_full, disp_field
+    """
+    Background worker that handles computationally intensive video registration.
+    Supports three methods:
+      - ANTs: Robust, intensity-based registration (requires antspyx).
+      - LDDMM: Diffeomorphic registration (uses local torch implementation).
+      - CoTracker: Point-based tracking combined with sparse-to-dense warping.
+    """
+    # Signals for UI updates
+    tracks_ready = pyqtSignal(object, object, object, object)  # (tracks_np, visibility, confidence, grid)
+    progress = pyqtSignal(int)                               # Percent completion (0-100)
+    status_update = pyqtSignal(str)                          # Human-readable status message
+
+    # final results: (tracks_np, visibility, confidence, grid, warped_full, disp_field)
     finished = pyqtSignal(object, object, object, object, object, object)
-    error = pyqtSignal(str)
+    error = pyqtSignal(str)                                  # Error message on failure
 
     def __init__(
         self,
@@ -63,22 +74,26 @@ class ProcessingWorker(QThread):
 
         self.method = method
         self.filter_name = filter_name
-        self.existing_data = existing_data  # currently not merged here; stored for future if you need it
-        self.queries = queries  # tensor (1,N,2) or None
+        # Stored for future use if merging is needed in the background
+        self.existing_data = existing_data
+        self.queries = queries  # torch.Tensor of shape (1, N, 2) or None
 
         self._is_running = True
 
     def stop(self):
+        """Safely terminate the background thread."""
         self._is_running = False
 
     def run(self):
+        """Execute the selected registration method and emit results."""
         tracks_gui = None
         vis_gui = None
         conf_gui = None
         grid_xy_ret = None
 
         try:
-            # ---------- ANTs ----------
+            # ---------- ANTs REGISTRATION ----------
+            # Uses symmetric normalization (SyN) to register frames to a reference (frame 0).
             if self.method == "ANTs":
                 if ants is None:
                     raise ImportError("ANTs is not installed. Please install it with 'pip install antspyx'")
@@ -129,17 +144,23 @@ class ProcessingWorker(QThread):
                     
                     moving_image = ants.from_numpy(moving_frame)
 
-                    reg = ants.registration(fixed=fixed_image, moving=moving_image, type_of_transform="SyNOnly")
-                    
-                    # Apply to vd_out[i]
-                    # If vd_out[i] is grayscale, apply directly. If color, apply to each channel or rely on ants.
-                    # Simplified: ANTs registration here is mostly for grayscale.
-                    # We convert vd_out[i] to ants image.
+                    reg = ants.registration(
+                        fixed=fixed_image,
+                        moving=moving_image,
+                        type_of_transform="SyNOnly"
+                    )
+
+                    # Apply transform to vd_out[i]
                     to_warp = vd_out[i]
                     if to_warp.ndim == 3 and to_warp.shape[-1] == 1:
-                        to_warp = to_warp[:, :, 0] # ants wants 2D for 2D images
-                    
-                    warped_image = ants.apply_transforms(fixed=fixed_image, moving=ants.from_numpy(to_warp), transformlist=reg['fwdtransforms'])
+                        # ANTs requires 2D input for 2D images
+                        to_warp = to_warp[:, :, 0]
+
+                    warped_image = ants.apply_transforms(
+                        fixed=fixed_image,
+                        moving=ants.from_numpy(to_warp),
+                        transformlist=reg['fwdtransforms']
+                    )
                     warped = warped_image.numpy()
                     
                     if vd_out[i].ndim == 3 and vd_out[i].shape[-1] == 1:
@@ -153,7 +174,8 @@ class ProcessingWorker(QThread):
                 self.finished.emit(None, None, None, None, warped_np, None)
                 return
 
-            # ---------- LDDMM ----------
+            # ---------- LDDMM REGISTRATION ----------
+            # Large Deformation Diffeomorphic Metric Mapping. Uses a local torch-based implementation.
             if self.method == "LDDMM":
                 if torch_lddmm is None:
                     raise ImportError("torch_lddmm is not available. Please ensure utils/torch_lddmm.py exists.")
@@ -236,7 +258,12 @@ class ProcessingWorker(QThread):
                 self.finished.emit(None, None, None, None, warped_np, None)
                 return
 
-            # ---------- CoTracker + warping ----------
+            # ---------- CoTracker + Warping ----------
+            # 1. Track points using Facebook's CoTracker.
+            # 2. Interpolate sparse point movements to a dense displacement field.
+            # 3. Warp frames using the dense field.
+            
+            # Normalize inputs to device
             video_in = self.video_in.to(DEFAULT_DEVICE) if isinstance(self.video_in, torch.Tensor) else self.video_in
             video_out = self.video_out.to(DEFAULT_DEVICE) if isinstance(self.video_out, torch.Tensor) else self.video_out
 
@@ -274,13 +301,17 @@ class ProcessingWorker(QThread):
                     if isinstance(queries, np.ndarray):
                         queries = torch.from_numpy(queries)
 
-                    if queries.ndim == 2:          # (N,2) -> (1,N,2)
+                    if queries.ndim == 2:  # (N, 2) -> (1, N, 2)
                         queries = queries.unsqueeze(0)
 
                     if queries.shape[-1] == 2:
-                        B, N, _ = queries.shape
-                        t0 = torch.zeros((B, N, 1), device = DEFAULT_DEVICE, dtype=queries.dtype)
-                        queries = torch.cat([t0, queries], dim=-1)  # -> (B,N,3) = (t,x,y)
+                        b_size, n_pts, _ = queries.shape
+                        t0 = torch.zeros(
+                            (b_size, n_pts, 1),
+                            device=DEFAULT_DEVICE,
+                            dtype=queries.dtype
+                        )
+                        queries = torch.cat([t0, queries], dim=-1)
 
 
                 if isinstance(video_in, torch.Tensor) and video_in.shape[1] == 1:
@@ -301,7 +332,8 @@ class ProcessingWorker(QThread):
                     old_tr, old_vis, old_conf = self.existing_data
 
                     old_tr = np.asarray(old_tr)  # (T, N_old, 2)
-                    if old_tr.ndim == 4: old_tr = old_tr[0]
+                    if old_tr.ndim == 4:
+                        old_tr = old_tr[0]
                     new_tr = tracks_gui          # (T, N_new, 2)
 
                     Tm = min(old_tr.shape[0], new_tr.shape[0])
@@ -348,7 +380,12 @@ class ProcessingWorker(QThread):
             if not self._is_running:
                 return
 
-            warped_video, disp_field = warping(tracks_for_warp, video_out, smoothing=self.df_sigma, callback=warp_cb)
+            warped_video, disp_field = warping(
+                tracks_for_warp,
+                video_out,
+                smoothing=self.df_sigma,
+                callback=warp_cb
+            )
 
             if not self._is_running:
                 return
@@ -376,12 +413,25 @@ class ProcessingWorker(QThread):
 
 
 class PGImagePanel(pg.GraphicsLayoutWidget):
-    pressed  = pyqtSignal(float, float, int)
-    moved    = pyqtSignal(float, float)
+    """
+    A scientific image viewer based on pyqtgraph.
+    Provides:
+      - Interactive contrast adjustment (via HistogramLUTItem).
+      - Coordinate mapping between screen, scene, and image units.
+      - Overlay support for scatter points and motion trajectories.
+      - Custom mouse handlers for point editing (add/delete/drag).
+    """
+    pressed  = pyqtSignal(float, float, int)  # (x, y, button_id) - image coords
+    moved    = pyqtSignal(float, float)        # (x, y) - image coords
     released = pyqtSignal()
     clicked_outside_image = pyqtSignal() 
 
     def __init__(self, parent=None, show_histogram=False):
+        """
+        Initialize the image panel.
+        :param parent: Parent QWidget.
+        :param show_histogram: Whether to include a HistogramLUTItem for contrast control.
+        """
         super().__init__(parent)
         self.setMinimumSize(50, 50)
         self.setBackground(None)
@@ -410,7 +460,7 @@ class PGImagePanel(pg.GraphicsLayoutWidget):
 
         self.img_item = pg.ImageItem()
         self.p1.addItem(self.img_item)
-        
+
         # Histograms
         self.hist = None
         if self.show_histogram:
@@ -418,7 +468,12 @@ class PGImagePanel(pg.GraphicsLayoutWidget):
             self.hist.setImageItem(self.img_item)
             self.addItem(self.hist)
 
-        self.pending_item = pg.ScatterPlotItem(size=10, pen=None, brush=pg.mkBrush(57, 255, 20), symbol='o')
+        self.pending_item = pg.ScatterPlotItem(
+            size=10,
+            pen=None,
+            brush=pg.mkBrush(57, 255, 20),
+            symbol='o'
+        )
         self.p1.addItem(self.pending_item)
 
 
@@ -430,8 +485,8 @@ class PGImagePanel(pg.GraphicsLayoutWidget):
             self.img_item.setOpts(autoDownsample=False)
 
         self.points_item = pg.ScatterPlotItem(size=8, pen=None, brush=pg.mkBrush(57, 255, 20, 200))
-        self.cross_item  = pg.ScatterPlotItem(size=10, pen=None, brush=pg.mkBrush(57, 255, 20), symbol='o')
-        self.traj_item   = pg.PlotDataItem(pen=pg.mkPen(57, 255, 20, 180, width=2))
+        self.cross_item = pg.ScatterPlotItem(size=10, pen=None, brush=pg.mkBrush(57, 255, 20), symbol='o')
+        self.traj_item = pg.PlotDataItem(pen=pg.mkPen(57, 255, 20, 180, width=2))
 
         self.p1.addItem(self.points_item)
         self.p1.addItem(self.cross_item)
@@ -477,6 +532,11 @@ class PGImagePanel(pg.GraphicsLayoutWidget):
         )
 
     def _trail_color(self, u):
+        """
+        Calculate a color for trajectory segments based on their age.
+        :param u: Normalized time value [0, 1].
+        :return: (r, g, b) tuple.
+        """
         # u in [0..1]
         yellow = (255, 255, 0)
         purple = (160, 0, 255)
@@ -494,6 +554,12 @@ class PGImagePanel(pg.GraphicsLayoutWidget):
                 self.hist.hide()
 
     def set_image(self, img_np, auto_range=True, levels=None):
+        """
+        Update the displayed image.
+        :param img_np: Image data as a numpy array.
+        :param auto_range: Whether to reset the ViewBox zoom.
+        :param levels: Optional (min, max) display levels.
+        """
         self._current_img = img_np
         if img_np is None:
             self.img_item.clear()
@@ -576,6 +642,11 @@ class PGImagePanel(pg.GraphicsLayoutWidget):
         return float(view_pos.x()), float(view_pos.y())
 
     def set_points(self, pts_xy=None, crosses_xy=None):
+        """
+        Update overlay points.
+        - pts_xy: Base grid or tracked points (drawn as circles).
+        - crosses_xy: Custom/manual points (drawn as crosses).
+        """
         if pts_xy is None or len(pts_xy) == 0:
             self.points_item.setData([], [])
         else:
@@ -589,6 +660,12 @@ class PGImagePanel(pg.GraphicsLayoutWidget):
             self.cross_item.setData(c[:, 0], c[:, 1])
 
     def set_trajectories(self, tracks_TN2, current_frame, trail=15):
+        """
+        Draw point motion trajectories for the specified trail length.
+        :param tracks_TN2: (T, N, 2) array of point tracks.
+        :param current_frame: The frame index to render.
+        :param trail: Number of previous frames to include in the trajectory.
+        """
         # Clear everything if nothing to draw
         if tracks_TN2 is None:
             for it in self.traj_items:
@@ -657,12 +734,14 @@ class PGImagePanel(pg.GraphicsLayoutWidget):
 
 
     def _map_scene_to_image(self, scene_pos):
+        """Convert graphics scene coordinates to image (view) coordinates."""
         if scene_pos is None:
             return None
         p = self.vb.mapSceneToView(scene_pos)
         return float(p.x()), float(p.y())
 
     def _qt_btn_to_int(self, btn):
+        """Map Qt MouseButton enum to integer (1:Left, 2:Middle, 3:Right)."""
         if btn == Qt.MouseButton.LeftButton:
             return 1
         if btn == Qt.MouseButton.MiddleButton:
@@ -679,11 +758,11 @@ class PGImagePanel(pg.GraphicsLayoutWidget):
         
         x, y = xy
         # Check scatter points
-        pts_x, pts_y = self.points_item.getData() # arrays
+        pts_x, pts_y = self.points_item.getData()
         if len(pts_x) > 0:
-            p0 = self.vb.mapSceneToView(pg.Point(0,0))
-            p1 = self.vb.mapSceneToView(pg.Point(10,0)) # 10 screen pixels
-            tol = abs(p1.x() - p0.x()) # Tolerance in image units
+            p0 = self.vb.mapSceneToView(pg.Point(0, 0))
+            p1 = self.vb.mapSceneToView(pg.Point(10, 0))  # 10 screen pixels
+            tol = abs(p1.x() - p0.x())  # Tolerance in image units
             
             d2 = (pts_x - x)**2 + (pts_y - y)**2
             if np.min(d2) < (tol*tol):
@@ -703,6 +782,7 @@ class PGImagePanel(pg.GraphicsLayoutWidget):
         return False
 
     def _img_shape_hw(self):
+        """Return the current image dimensions as (H, W)."""
         img = getattr(self, "_current_img", None)
         if img is None:
             return None
@@ -712,6 +792,7 @@ class PGImagePanel(pg.GraphicsLayoutWidget):
         return int(a.shape[0]), int(a.shape[1])  # (H,W,C)
 
     def mousePressEvent(self, ev):
+        """Custom mouse press handler for point editing and viewport panning."""
         btn = ev.button()
 
         # Map click to image coords (view coords)
@@ -739,15 +820,18 @@ class PGImagePanel(pg.GraphicsLayoutWidget):
             return
 
         # ----- INSIDE IMAGE -----
-
         if btn == Qt.MouseButton.LeftButton:
-            # if click over a point: start "edit drag" (consume event -> no pan)
+            # INTERACTION LOGIC:
+            # 1. If clicking directly over a point, we immediately start an "edit drag".
+            #    This consumes the event to prevent the ViewBox from panning the image.
             if self._is_over_point(ev.position()):
                 self.pressed.emit(float(x), float(y), 1)
                 ev.accept()
                 return
 
-            # empty area: could be click (add point) OR drag (pan)
+            # 2. If clicking on empty space, we WAIT to see if it's a drag or a click.
+            #    If the mouse moves significantly (>5px) before release, it's a pan.
+            #    If it stays still, it's a point-addition click (emitted in mouseReleaseEvent).
             self._possible_click = True
             self.last_mouse_pos = ev.position()
             # DO NOT emit pressed here (otherwise you "add" immediately and kill pan)
@@ -762,6 +846,7 @@ class PGImagePanel(pg.GraphicsLayoutWidget):
         super().mousePressEvent(ev)
 
     def mouseMoveEvent(self, ev):
+        """Custom mouse move handler for point dragging and hover previews."""
         # detect if user started dragging -> then it is NOT a click
         if self._possible_click and self.last_mouse_pos is not None:
             dist = (ev.position() - self.last_mouse_pos).manhattanLength()
@@ -775,6 +860,7 @@ class PGImagePanel(pg.GraphicsLayoutWidget):
         super().mouseMoveEvent(ev)
 
     def mouseReleaseEvent(self, ev):
+        """Custom mouse release handler to finalize point additions."""
         # if it was a clean left-click on empty space (no drag), emit pressed once here
         if ev.button() == Qt.MouseButton.LeftButton and self._possible_click:
             pos = self._map_scene_to_image(ev.position())
@@ -794,12 +880,14 @@ class PGImagePanel(pg.GraphicsLayoutWidget):
 
 
     def reset_view(self):
+        """Reset the ViewBox to show the full image."""
         if getattr(self, "native_1to1", False):
             self._apply_native_1to1(keep_center=False)
         else:
             self.vb.autoRange()
 
-    def set_points_colored(self, pts_xy, colors_rgba=None, size=8):       
+    def set_points_colored(self, pts_xy, colors_rgba=None, size=8):
+        """Update tracked points with frame-specific colors (e.g., for visibility)."""
         if pts_xy is None or len(pts_xy) == 0:
             self.points_item.setData([], [])
             return
@@ -809,21 +897,33 @@ class PGImagePanel(pg.GraphicsLayoutWidget):
 
         if colors_rgba is None:
             # Default highlight color if no specific colors provided
-            spots = [{'pos': (p[i,0], p[i,1]), 'size': size, 'brush': pg.mkBrush(0,255,0,255)} for i in range(N)]
+            spots = [
+                {'pos': (p[i, 0], p[i, 1]), 'size': size, 'brush': pg.mkBrush(0, 255, 0, 255)}
+                for i in range(N)
+            ]
         else:
             c = np.asarray(colors_rgba, dtype=np.uint8)
             spots = []
             for i in range(N):
-                r,g,b,a = map(int, c[i])
-                spots.append({'pos': (p[i,0], p[i,1]), 'size': size, 'brush': pg.mkBrush(r,g,b,a)})
+                r, g, b, a = map(int, c[i])
+                spots.append({
+                    'pos': (p[i, 0], p[i, 1]),
+                    'size': size,
+                    'brush': pg.mkBrush(r, g, b, a)
+                })
 
         self.points_item.setData(spots=spots)
 
 
 class MotionProfileWidget(QWidget):
+    """
+    A custom widget that displays temporal motion and deformation scores.
+    Rendered as a line plot with a frame-synced cursor.
+    """
     frame_changed = pyqtSignal(int)
 
     def __init__(self, parent=None):
+        """Initialize the motion profile widget."""
         super().__init__(parent)
         self.setFixedHeight(50)
         self.motion_scores = []      # Cyan line
@@ -848,16 +948,20 @@ class MotionProfileWidget(QWidget):
         self.update()
 
     def set_current_frame(self, frame_idx):
+        """Update the cursor position to the specified frame."""
         self.current_frame = frame_idx
         self.update()
 
     def mousePressEvent(self, event):
+        """Handle mouse press to scrub through frames."""
         self._handle_mouse(event)
 
     def mouseMoveEvent(self, event):
+        """Handle mouse move to scrub through frames."""
         self._handle_mouse(event)
 
     def _handle_mouse(self, event):
+        """Map mouse horizontal position to frame index and emit signal."""
         # Allow interaction if EITHER plot exists
         count_m = len(self.motion_scores) if self.motion_scores is not None else 0
         count_d = len(self.deformation_scores) if self.deformation_scores is not None else 0
@@ -875,6 +979,7 @@ class MotionProfileWidget(QWidget):
         self.frame_changed.emit(frame_idx)
 
     def paintEvent(self, event):
+        """Render the motion/deformation scores and frame cursor."""
         from PyQt6.QtCore import QPointF
         from PyQt6.QtGui import QPolygonF, QPen
         painter = QPainter(self)
@@ -912,13 +1017,14 @@ class MotionProfileWidget(QWidget):
 
             # Draw Motion (Cyan)
             draw_line(self.motion_scores, QColor(0, 200, 255))
-
-            # # Draw Deformation (Magenta)
-            # draw_line(self.deformation_scores, QColor(255, 0, 255))
             
             # Draw current frame cursor
-            count_m = len(self.motion_scores) if self.motion_scores is not None else 0
-            count_d = len(self.deformation_scores) if self.deformation_scores is not None else 0
+            count_m = (
+                len(self.motion_scores) if self.motion_scores is not None else 0
+            )
+            count_d = (
+                len(self.deformation_scores) if self.deformation_scores is not None else 0
+            )
             count = max(count_m, count_d)
 
             if count > 0:
@@ -931,7 +1037,9 @@ class MotionProfileWidget(QWidget):
 
 
 class ParameterDialog(QDialog):
+    """A scrollable dialog for adjusting algorithm parameters."""
     def __init__(self, parent=None):
+        """Initialize the parameter dialog."""
         super().__init__(parent)
         self.setWindowTitle("Parameters")
         self.setModal(False)
@@ -957,6 +1065,13 @@ class VideoLoadSettingsDialog(QDialog):
     or choose smaller width/height + fewer frames.
     """
     def __init__(self, parent, orig_frames: int | None, orig_w: int | None, orig_h: int | None):
+        """
+        Initialize the video load settings dialog.
+        :param parent: Parent QWidget.
+        :param orig_frames: Original number of frames.
+        :param orig_w: Original width.
+        :param orig_h: Original height.
+        """
         super().__init__(parent)
         self.setWindowTitle("Load settings")
 
@@ -971,7 +1086,9 @@ class VideoLoadSettingsDialog(QDialog):
         w_txt = str(orig_w) if orig_w is not None else "unknown"
         h_txt = str(orig_h) if orig_h is not None else "unknown"
 
-        self.info_lbl = QLabel(f"Original:\n  Frames: {f_txt}\n  Size: {w_txt} × {h_txt}")
+        self.info_lbl = QLabel(
+            f"Original:\n  Frames: {f_txt}\n  Size: {w_txt} × {h_txt}"
+        )
         self.info_lbl.setStyleSheet("font-size: 12px;")
         layout.addWidget(self.info_lbl)
 
@@ -1039,6 +1156,7 @@ class VideoLoadSettingsDialog(QDialog):
         self._result = None  # dict or None
 
     def _update_enabled(self, *_):
+        """Enable/disable spinboxes based on checkbox states."""
         self.w_spin.setEnabled(not self.keep_original_size_chk.isChecked())
         self.h_spin.setEnabled(not self.keep_original_size_chk.isChecked())
         self.max_frames_spin.setEnabled(not self.load_all_frames_chk.isChecked())
@@ -1055,6 +1173,7 @@ class VideoLoadSettingsDialog(QDialog):
                 self.max_frames_spin.setValue(int(self.orig_frames))
 
     def _accept(self):
+        """Validate settings and close the dialog with an accepted result."""
         # width/height: None means "use original"
         if self.keep_original_size_chk.isChecked():
             target_w = None
@@ -1064,7 +1183,10 @@ class VideoLoadSettingsDialog(QDialog):
             target_h = int(self.h_spin.value())
 
         # max_frames: None means "all frames"
-        max_frames = None if self.load_all_frames_chk.isChecked() else int(self.max_frames_spin.value())
+        max_frames = (
+            None if self.load_all_frames_chk.isChecked()
+            else int(self.max_frames_spin.value())
+        )
 
         self._result = {
             "target_w": target_w,
@@ -1074,16 +1196,13 @@ class VideoLoadSettingsDialog(QDialog):
         self.accept()
 
     def result_settings(self):
+        """Return the user-selected load parameters."""
         return self._result
 
 
-
-
-
-
 if __name__ == "__main__":
-    from motioncorrection import MotionCorrectionGUI
+    from controller import ControllerGUI
     app = QApplication(sys.argv)
-    gui = MotionCorrectionGUI()
+    gui = ControllerGUI()
     gui.show()
     sys.exit(app.exec())
