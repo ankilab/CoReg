@@ -58,19 +58,20 @@ def resize_video_tensor_to_wh(video_t: torch.Tensor, target_w: int, target_h: in
     return vt
 
 
-def _ensure_thwc_rgb_uint8(video_np: np.ndarray) -> np.ndarray:
+def _ensure_thwc_gray_uint8(video_np: np.ndarray) -> np.ndarray:
     """
-    Ensure video is (T,H,W,3) uint8.
+    Ensure video is (T,H,W,1) uint8.
+    If input is color (RGB/RGBA), it is converted to grayscale.
 
     Accepts:
       - (H,W)
       - (T,H,W)
       - (H,W,3)
       - (T,H,W,3)
-      - (T,H,W,4) (drops alpha)
+      - (T,H,W,4)
 
     Returns:
-      (T,H,W,3) uint8
+      (T,H,W,1) uint8
     """
     v = np.asarray(video_np)
 
@@ -87,16 +88,13 @@ def _ensure_thwc_rgb_uint8(video_np: np.ndarray) -> np.ndarray:
     if v.ndim != 4:
         raise ValueError(f"Unsupported video shape: {v.shape}")
 
-    # Drop alpha
-    if v.shape[-1] == 4:
-        v = v[..., :3]
-
-    # Gray -> RGB
-    if v.shape[-1] == 1:
-        v = np.repeat(v, 3, axis=-1)
-
-    if v.shape[-1] != 3:
-        raise ValueError(f"Unsupported channel count: {v.shape}")
+    # Convert color to gray if present
+    if v.shape[-1] in (3, 4):
+        gray_frames = []
+        for i in range(v.shape[0]):
+            code = cv2.COLOR_RGB2GRAY if v.shape[-1] == 3 else cv2.COLOR_RGBA2GRAY
+            gray_frames.append(cv2.cvtColor(v[i], code))
+        v = np.stack(gray_frames, axis=0)[..., None]  # (T,H,W,1)
 
     return v.astype(np.uint8, copy=False)
 
@@ -125,7 +123,7 @@ def _resize_video_thwc(video_thwc: np.ndarray, resize: bool, target_size_wh=(256
 
 def _to_torch_tchw(video_thwc_uint8: np.ndarray) -> torch.Tensor:
     """
-    Convert (T,H,W,3) uint8 -> torch float (T,3,H,W)
+    Convert (T,H,W,C) uint8 -> torch float (T,C,H,W)
     """
     return torch.from_numpy(video_thwc_uint8).permute(0, 3, 1, 2).contiguous().float()
 
@@ -167,7 +165,7 @@ def load_hdf5(h5_path: str, dataset_path: str, frames: int | None = None, resize
     if video.dtype != np.uint8:
         video = to_uint8_contrast(video)
 
-    v_thwc = _ensure_thwc_rgb_uint8(video)          # (T,H,W,3) uint8
+    v_thwc = _ensure_thwc_gray_uint8(video)          # (T,H,W,1) uint8
     v_thwc = _resize_video_thwc(v_thwc, resize, size_wh)
     return _to_torch_tchw(v_thwc)
 
@@ -190,7 +188,7 @@ def load_tiff(path: str, frames: int | None = None, resize=True, size_wh=(256, 2
         video = video.astype(video.dtype.type)
 
     v_u8 = to_uint8_contrast(video)                 # (T,H,W) uint8
-    v_thwc = _ensure_thwc_rgb_uint8(v_u8)           # (T,H,W,3)
+    v_thwc = _ensure_thwc_gray_uint8(v_u8)           # (T,H,W,1)
     v_thwc = _resize_video_thwc(v_thwc, resize, size_wh)
     return _to_torch_tchw(v_thwc)
 
@@ -208,21 +206,26 @@ def load_video(file: str, resize=True, size_wh=(256, 256), max_frames: int | Non
     if max_frames is not None:
         video = video[: int(max_frames)]
 
-    frames = []
+    processed_frames = []
     for frame in video:
         f = np.asarray(frame)
-        if f.ndim == 2:
-            f = cv2.cvtColor(f, cv2.COLOR_GRAY2RGB)
-        elif f.ndim == 3 and f.shape[2] == 4:
-            f = f[..., :3]
-
+        # Convert color to gray if needed
+        if f.ndim == 3:
+            if f.shape[2] == 4:
+                f = cv2.cvtColor(f, cv2.COLOR_RGBA2GRAY)
+            elif f.shape[2] == 3:
+                f = cv2.cvtColor(f, cv2.COLOR_RGB2GRAY)
+        
         if resize:
             target_w, target_h = int(size_wh[0]), int(size_wh[1])
             f = cv2.resize(f, (target_w, target_h), interpolation=cv2.INTER_AREA)
+        
+        if f.ndim == 2:
+            f = f[..., None] # Ensure (H,W,1)
+        
+        processed_frames.append(f)
 
-        frames.append(f)
-
-    v_thwc = np.ascontiguousarray(np.stack(frames, axis=0)).astype(np.uint8, copy=False)  # (T,H,W,3)
+    v_thwc = np.stack(processed_frames, axis=0).astype(np.uint8) # (T,H,W,1)
     return _to_torch_tchw(v_thwc)
 
 

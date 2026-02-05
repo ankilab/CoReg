@@ -321,6 +321,10 @@ class MotionCorrectionGUI(QMainWindow):
         self.clear_points_btn.clicked.connect(self.clear_points)
         self.clear_points_btn.setEnabled(False)
 
+        self.show_contrast_chk = QCheckBox("Contrast controls")
+        self.show_contrast_chk.setChecked(True)
+        self.show_contrast_chk.stateChanged.connect(self.on_show_contrast_toggled)
+
         self.undo_btn = QPushButton("Reset to Preset")
         self.undo_btn.clicked.connect(self.undo_all_changes)
         self.undo_btn.setEnabled(False)
@@ -352,6 +356,7 @@ class MotionCorrectionGUI(QMainWindow):
   
         #second_bar.addWidget(self.clear_points_btn)
         #pd_layout.addWidget(self.undo_btn)
+        second_bar.addWidget(self.show_contrast_chk)
         second_bar.addWidget(QLabel("DF σ:"))
         second_bar.addWidget(self.df_sigma_spin)
 
@@ -390,8 +395,8 @@ class MotionCorrectionGUI(QMainWindow):
         self.view_right_combo.currentTextChanged.connect(lambda *_: self.update_plot())
 
         # Panels
-        self.view_left = PGImagePanel()
-        self.view_right = PGImagePanel()
+        self.view_left = PGImagePanel(show_histogram=True)
+        self.view_right = PGImagePanel(show_histogram=False)
         self.view_left.clicked_outside_image.connect(self._exit_edit_modes_if_enabled)
         self.view_right.clicked_outside_image.connect(self._exit_edit_modes_if_enabled)
         self.view_left._parent_gui = self
@@ -524,8 +529,8 @@ class MotionCorrectionGUI(QMainWindow):
         return float(np.min(x[finite])), float(np.max(x[finite]))
 
     def on_sync_view_toggled(self, state):
-        master_vb = self.view_left.getViewBox()
-        vb_r = self.view_right.getViewBox()
+        master_vb = self.view_left.vb
+        vb_r = self.view_right.vb
 
         if state == Qt.CheckState.Checked.value:
             vb_r.setXLink(master_vb)
@@ -535,6 +540,11 @@ class MotionCorrectionGUI(QMainWindow):
             vb_r.setXLink(None)
             vb_r.setYLink(None)
             self.status_label.setText("View sync: OFF")
+
+    def on_show_contrast_toggled(self, state):
+        visible = (state == Qt.CheckState.Checked.value)
+        self.view_left.set_histogram_visible(visible)
+        self.view_right.set_histogram_visible(visible)
 
     def _set_visible(self, widgets, visible: bool):
         for w in widgets:
@@ -1727,13 +1737,17 @@ class MotionCorrectionGUI(QMainWindow):
 
         # ---------- INPUT ----------
         if which == "Input":
-            panel.set_image(original_frame, auto_range=False, levels=levels_orig)
+            # If histogram is visible, we WANT it to keep its levels during play.
+            # Passing levels=None to set_image tells PGImagePanel to reuse its internal levels.
+            lev = None if (panel.hist and panel.hist.isVisible()) else levels_orig
+            panel.set_image(original_frame, auto_range=False, levels=lev)
             clear_overlays()
             return
 
         # ---------- TRACKED POINTS (ONLY place to draw tracks) ----------
         if which == "Tracked Points":
-            panel.set_image(filtered_frame, auto_range=False, levels=levels_filt)
+            lev = None if (panel.hist and panel.hist.isVisible()) else levels_filt
+            panel.set_image(filtered_frame, auto_range=False, levels=lev)
 
             tracks = self.viz_data.get("tracks", None)
             if tracks is None:

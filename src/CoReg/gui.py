@@ -84,19 +84,31 @@ class ProcessingWorker(QThread):
                     raise ImportError("ANTs is not installed. Please install it with 'pip install antspyx'")
 
                 self.status_update.emit("Running ANTs registration...")
-                vd = self.video_data
-                if isinstance(vd, torch.Tensor):
-                    vd = vd.detach().cpu().numpy()
+                # Registration sources
+                vd_reg = self.video_in
+                if isinstance(vd_reg, torch.Tensor):
+                    vd_reg = vd_reg.detach().cpu().numpy()
+                if vd_reg.ndim == 4 and vd_reg.shape[1] in [1, 3]:
+                    vd_reg = np.transpose(vd_reg, (0, 2, 3, 1))
 
-                if vd.ndim == 4 and vd.shape[1] in [1, 3]:
-                    vd = np.transpose(vd, (0, 2, 3, 1))  # (T,H,W,C)
+                # Output sources (the data we actually warp)
+                vd_out = self.video_out
+                if isinstance(vd_out, torch.Tensor):
+                    vd_out = vd_out.detach().cpu().numpy()
+                if vd_out.ndim == 4 and vd_out.shape[1] in [1, 3]:
+                    vd_out = np.transpose(vd_out, (0, 2, 3, 1))
 
-                T = vd.shape[0]
+                T = vd_reg.shape[0]
                 results = []
 
-                ref_frame = vd[0]
-                if ref_frame.ndim == 3 and ref_frame.shape[-1] == 3:
-                    ref_frame = cv2.cvtColor(ref_frame, cv2.COLOR_RGB2GRAY)
+                # Ensure ref_frame is 2D grayscale for ANTs
+                ref_frame = vd_reg[0]
+                if ref_frame.ndim == 3:
+                    if ref_frame.shape[-1] == 3:
+                        ref_frame = cv2.cvtColor(ref_frame, cv2.COLOR_RGB2GRAY)
+                    else:
+                        ref_frame = ref_frame[:, :, 0]
+                
                 fixed_image = ants.from_numpy(ref_frame)
 
                 for i in range(T):
@@ -105,22 +117,34 @@ class ProcessingWorker(QThread):
                     self.progress.emit(int(i / max(1, T) * 100))
 
                     if i == 0:
-                        first = ref_frame
-                        if vd[0].ndim == 3 and vd[0].shape[-1] == 3:
-                            first = np.stack([first] * 3, axis=-1)
-                        results.append(first)
+                        results.append(vd_out[0])
                         continue
 
-                    moving_frame = vd[i]
-                    if moving_frame.ndim == 3 and moving_frame.shape[-1] == 3:
-                        moving_frame = cv2.cvtColor(moving_frame, cv2.COLOR_RGB2GRAY)
+                    moving_frame = vd_reg[i]
+                    if moving_frame.ndim == 3:
+                        if moving_frame.shape[-1] == 3:
+                            moving_frame = cv2.cvtColor(moving_frame, cv2.COLOR_RGB2GRAY)
+                        else:
+                            moving_frame = moving_frame[:, :, 0]
+                    
                     moving_image = ants.from_numpy(moving_frame)
 
                     reg = ants.registration(fixed=fixed_image, moving=moving_image, type_of_transform="SyNOnly")
-                    warped = reg["warpedmovout"].numpy()
-
-                    if vd[i].ndim == 3 and vd[i].shape[-1] == 3:
-                        warped = np.stack([warped] * 3, axis=-1)
+                    
+                    # Apply to vd_out[i]
+                    # If vd_out[i] is grayscale, apply directly. If color, apply to each channel or rely on ants.
+                    # Simplified: ANTs registration here is mostly for grayscale.
+                    # We convert vd_out[i] to ants image.
+                    to_warp = vd_out[i]
+                    if to_warp.ndim == 3 and to_warp.shape[-1] == 1:
+                        to_warp = to_warp[:, :, 0] # ants wants 2D for 2D images
+                    
+                    warped_image = ants.apply_transforms(fixed=fixed_image, moving=ants.from_numpy(to_warp), transformlist=reg['fwdtransforms'])
+                    warped = warped_image.numpy()
+                    
+                    if vd_out[i].ndim == 3 and vd_out[i].shape[-1] == 1:
+                        warped = warped[..., None]
+                    
                     results.append(warped)
 
                 warped_np = np.stack(results, axis=0)
@@ -135,19 +159,29 @@ class ProcessingWorker(QThread):
                     raise ImportError("torch_lddmm is not available. Please ensure utils/torch_lddmm.py exists.")
 
                 self.status_update.emit("Running LDDMM registration...")
-                vd = self.video_data
-                if isinstance(vd, torch.Tensor):
-                    vd = vd.detach().cpu().numpy()
+                # Registration sources
+                vd_reg = self.video_in
+                if isinstance(vd_reg, torch.Tensor):
+                    vd_reg = vd_reg.detach().cpu().numpy()
+                if vd_reg.ndim == 4 and vd_reg.shape[1] in [1, 3]:
+                    vd_reg = np.transpose(vd_reg, (0, 2, 3, 1))
 
-                if vd.ndim == 4 and vd.shape[1] in [1, 3]:
-                    vd = np.transpose(vd, (0, 2, 3, 1))  # (T,H,W,C)
+                # Output sources
+                vd_out = self.video_out
+                if isinstance(vd_out, torch.Tensor):
+                    vd_out = vd_out.detach().cpu().numpy()
+                if vd_out.ndim == 4 and vd_out.shape[1] in [1, 3]:
+                    vd_out = np.transpose(vd_out, (0, 2, 3, 1))
 
-                T = vd.shape[0]
+                T = vd_reg.shape[0]
                 results = []
 
-                ref_frame = vd[0]
-                if ref_frame.ndim == 3 and ref_frame.shape[-1] == 3:
-                    ref_frame = cv2.cvtColor(ref_frame, cv2.COLOR_RGB2GRAY)
+                ref_frame = vd_reg[0]
+                if ref_frame.ndim == 3:
+                    if ref_frame.shape[-1] == 3:
+                        ref_frame = cv2.cvtColor(ref_frame, cv2.COLOR_RGB2GRAY)
+                    else:
+                        ref_frame = ref_frame[:, :, 0]
 
                 for i in range(T):
                     if not self._is_running:
@@ -155,15 +189,15 @@ class ProcessingWorker(QThread):
                     self.progress.emit(int(i / max(1, T) * 100))
 
                     if i == 0:
-                        first = ref_frame
-                        if vd[0].ndim == 3 and vd[0].shape[-1] == 3:
-                            first = np.stack([first] * 3, axis=-1)
-                        results.append(first)
+                        results.append(vd_out[0])
                         continue
 
-                    moving_frame = vd[i]
-                    if moving_frame.ndim == 3 and moving_frame.shape[-1] == 3:
-                        moving_frame = cv2.cvtColor(moving_frame, cv2.COLOR_RGB2GRAY)
+                    moving_frame = vd_reg[i]
+                    if moving_frame.ndim == 3:
+                        if moving_frame.shape[-1] == 3:
+                            moving_frame = cv2.cvtColor(moving_frame, cv2.COLOR_RGB2GRAY)
+                        else:
+                            moving_frame = moving_frame[:, :, 0]
 
                     lddmm = torch_lddmm.LDDMM(
                         template=[moving_frame],
@@ -181,11 +215,19 @@ class ProcessingWorker(QThread):
                         verbose=False,
                     )
                     lddmm.run()
-                    warped = lddmm.outputDeformedTemplate()[0]
-
-                    if vd[i].ndim == 3 and vd[i].shape[-1] == 3:
-                        warped = np.stack([warped] * 3, axis=-1)
-
+                    
+                    # Apply displacement to vd_out[i]
+                    disp = lddmm.outputDisplacement()
+                    to_warp = vd_out[i]
+                    if to_warp.ndim == 3 and to_warp.shape[-1] == 1:
+                        # torch_lddmm.applyDisplacement usually wants (H,W) or (C,H,W)
+                        to_warp = to_warp[:, :, 0]
+                    
+                    warped = lddmm.applyDisplacement(to_warp, disp)
+                    
+                    if vd_out[i].ndim == 3 and vd_out[i].shape[-1] == 1:
+                        warped = warped[..., None]
+                        
                     results.append(warped)
 
                 warped_np = np.stack(results, axis=0)
@@ -240,6 +282,9 @@ class ProcessingWorker(QThread):
                         t0 = torch.zeros((B, N, 1), device = DEFAULT_DEVICE, dtype=queries.dtype)
                         queries = torch.cat([t0, queries], dim=-1)  # -> (B,N,3) = (t,x,y)
 
+
+                if isinstance(video_in, torch.Tensor) and video_in.shape[1] == 1:
+                    video_in = video_in.repeat(1, 3, 1, 1)
 
                 pred_tracks, pred_visibility = cotrack_model(video_in, queries=queries, device=DEFAULT_DEVICE)
 
@@ -330,53 +375,51 @@ class ProcessingWorker(QThread):
 
 
 
-class PGImagePanel(pg.PlotWidget):
+class PGImagePanel(pg.GraphicsLayoutWidget):
     pressed  = pyqtSignal(float, float, int)
     moved    = pyqtSignal(float, float)
     released = pyqtSignal()
     clicked_outside_image = pyqtSignal() 
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, show_histogram=False):
         super().__init__(parent)
         self.setMinimumSize(50, 50)
-
         self.setBackground(None)
-        self.setMenuEnabled(False)
-        self.hideButtons()
-        self.showAxis('left', False)
-        self.showAxis('bottom', False)
 
         # Set size policy to expand and fill available space
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
-        # Disable native_1to1 to allow full image viewing
-        self.native_1to1 = False
+        self.show_histogram = show_histogram
+
+        # Create PlotItem inside the layout
+        self.p1 = self.addPlot()
+        self.p1.setMenuEnabled(False)
+        self.p1.hideAxis('left')
+        self.p1.hideAxis('bottom')
+        
+        self.vb = self.p1.getViewBox()
+        self.vb.setDefaultPadding(0.0)
+        self.vb.setAspectLocked(True)
+        self.vb.invertY(True)
+        self.vb.setMouseEnabled(x=True, y=True)
+
         self._img_w = None
         self._img_h = None
-
-        self.vb = self.getViewBox()
-        self.vb.setDefaultPadding(0.0)
-        
-        # Lock aspect ratio to prevent stretching
-        # The image will fit in the panel with black borders if needed
-        self.vb.setAspectLocked(True)
-        
-        # Invert Y axis for image coordinates
-        self.vb.invertY(True)
-        
-        # We'll control mouse handling dynamically based on edit mode
-        self.vb.setMouseEnabled(x=True, y=True)
-        
-        # Track if we're in a custom drag operation
-        self._custom_drag_active = False
-        
-        # Store reference to parent GUI (will be set later)
         self._parent_gui = None
+        self._custom_drag_active = False
 
         self.img_item = pg.ImageItem()
-        self.addItem(self.img_item)
+        self.p1.addItem(self.img_item)
+        
+        # Histograms
+        self.hist = None
+        if self.show_histogram:
+            self.hist = pg.HistogramLUTItem()
+            self.hist.setImageItem(self.img_item)
+            self.addItem(self.hist)
+
         self.pending_item = pg.ScatterPlotItem(size=10, pen=None, brush=pg.mkBrush(57, 255, 20), symbol='o')
-        self.addItem(self.pending_item)
+        self.p1.addItem(self.pending_item)
 
 
 
@@ -390,14 +433,14 @@ class PGImagePanel(pg.PlotWidget):
         self.cross_item  = pg.ScatterPlotItem(size=10, pen=None, brush=pg.mkBrush(57, 255, 20), symbol='o')
         self.traj_item   = pg.PlotDataItem(pen=pg.mkPen(57, 255, 20, 180, width=2))
 
-        self.addItem(self.points_item)
-        self.addItem(self.cross_item)
+        self.p1.addItem(self.points_item)
+        self.p1.addItem(self.cross_item)
         self.max_trail = 30  
         self.traj_items = []
         for _ in range(self.max_trail):
             it = pg.PlotDataItem()
             self.traj_items.append(it)
-            self.addItem(it)
+            self.p1.addItem(it)
         
         self.img_item.setZValue(0)
         self.traj_item.setZValue(5)
@@ -442,6 +485,14 @@ class PGImagePanel(pg.PlotWidget):
         b = int(round(yellow[2] + (purple[2] - yellow[2]) * u))
         return r, g, b
 
+    def set_histogram_visible(self, visible):
+        """Show or hide the HistogramLUTItem if it exists."""
+        if self.hist:
+            if visible:
+                self.hist.show()
+            else:
+                self.hist.hide()
+
     def set_image(self, img_np, auto_range=True, levels=None):
         self._current_img = img_np
         if img_np is None:
@@ -455,20 +506,35 @@ class PGImagePanel(pg.PlotWidget):
             return
 
         a = np.asarray(img_np)
+        if a.ndim == 3 and a.shape[-1] == 1:
+            a = a[:, :, 0]
 
         # ---- make display-safe for pyqtgraph ----
         if a.dtype.kind == "f":
-            # grayscale float -> provide explicit levels
+            # grayscale float
             if a.ndim == 2:
-                finite = np.isfinite(a)
-                if finite.any():
-                    lo = float(np.nanpercentile(a[finite], 1))
-                    hi = float(np.nanpercentile(a[finite], 99))
-                    if hi <= lo:
-                        hi = lo + 1.0
+                # If explicit levels provided, use them and update histogram
+                if levels is not None:
+                    lo, hi = levels
+                    self.img_item.setImage(a, levels=(lo, hi), autoLevels=False)
+                    if self.hist:
+                        self.hist.setLevels(lo, hi)
+                elif self.hist and self.hist.isVisible():
+                    # If histogram is visible, use ITS current levels (respecting manual user adjustment)
+                    lo, hi = self.hist.getLevels()
                     self.img_item.setImage(a, levels=(lo, hi), autoLevels=False)
                 else:
-                    self.img_item.setImage(a)
+                    # Fallback to percentile calculation
+                    finite = np.isfinite(a)
+                    if finite.any():
+                        lo = float(np.nanpercentile(a[finite], 1))
+                        hi = float(np.nanpercentile(a[finite], 99))
+                        if hi <= lo: hi = lo + 1.0
+                        self.img_item.setImage(a, levels=(lo, hi), autoLevels=False)
+                        if self.hist:
+                            self.hist.setLevels(lo, hi)
+                    else:
+                        self.img_item.setImage(a)
             else:
                 # RGB/RGBA float -> convert to uint8
                 finite = np.isfinite(a)
@@ -485,6 +551,8 @@ class PGImagePanel(pg.PlotWidget):
                 else:
                     a = np.zeros_like(a, dtype=np.uint8)
                 self.img_item.setImage(a, autoLevels=False)
+                if self.hist and levels is not None:
+                    self.hist.setLevels(*levels)
         else:
             if a.dtype == np.bool_:
                 a = (a.astype(np.uint8) * 255)
