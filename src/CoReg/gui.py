@@ -40,7 +40,8 @@ class ProcessingWorker(QThread):
 
     def __init__(
         self,
-        video_data,
+        video_in,
+        video_out=None,
         base_grid_pts=None,
         custom_grid_pts=None,
         df_sigma=3.0,
@@ -53,7 +54,8 @@ class ProcessingWorker(QThread):
     ):
         super().__init__(parent)
 
-        self.video_data = video_data
+        self.video_in = video_in
+        self.video_out = video_out if video_out is not None else video_in
         self.base_grid_pts = base_grid_pts
         self.custom_grid_pts = custom_grid_pts
         self.df_sigma = float(df_sigma)
@@ -193,7 +195,8 @@ class ProcessingWorker(QThread):
                 return
 
             # ---------- CoTracker + warping ----------
-            video = self.video_data.to(DEFAULT_DEVICE) if isinstance(self.video_data, torch.Tensor) else self.video_data
+            video_in = self.video_in.to(DEFAULT_DEVICE) if isinstance(self.video_in, torch.Tensor) else self.video_in
+            video_out = self.video_out.to(DEFAULT_DEVICE) if isinstance(self.video_out, torch.Tensor) else self.video_out
 
             # Build queries tensor (1,N,2)
             queries = None
@@ -238,7 +241,7 @@ class ProcessingWorker(QThread):
                         queries = torch.cat([t0, queries], dim=-1)  # -> (B,N,3) = (t,x,y)
 
 
-                pred_tracks, pred_visibility = cotrack_model(video, queries=queries, device=DEFAULT_DEVICE)
+                pred_tracks, pred_visibility = cotrack_model(video_in, queries=queries, device=DEFAULT_DEVICE)
 
                 tracks_raw = pred_tracks.detach().cpu().numpy()
                 tracks_gui = tracks_raw[0] if tracks_raw.ndim == 4 else tracks_raw
@@ -300,7 +303,7 @@ class ProcessingWorker(QThread):
             if not self._is_running:
                 return
 
-            warped_video, disp_field = warping(tracks_for_warp, video, smoothing=self.df_sigma, callback=warp_cb)
+            warped_video, disp_field = warping(tracks_for_warp, video_out, smoothing=self.df_sigma, callback=warp_cb)
 
             if not self._is_running:
                 return
