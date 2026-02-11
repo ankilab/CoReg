@@ -9,42 +9,54 @@ import torch.nn.functional as F
 from scipy.interpolate import griddata
 from scipy.ndimage import map_coordinates
 
-# Memory cleanup to prevent OOM errors
-torch.cuda.empty_cache()
-gc.collect()
+_COTRACKER = None
+_COTRACKER_DEVICE = None
+
+
+def _get_cotracker(device: str):
+    global _COTRACKER, _COTRACKER_DEVICE
+    if _COTRACKER is None or _COTRACKER_DEVICE != str(device):
+        os.environ["TORCH_HOME"] = "/data/users/va11moje/cache/cotracker"
+        model = torch.hub.load("facebookresearch/co-tracker", "cotracker3_offline")
+        model = model.to(device).eval()
+        _COTRACKER = model
+        _COTRACKER_DEVICE = str(device)
+    return _COTRACKER
 
 
 
-
+@torch.inference_mode()
 def cotrack_model(video, queries, device, grid_size=0):
     """
-    Run the CoTracker model on the provided video and grid points.
-
-    :param video: (T, C, H, W) video tensor.
-    :param queries: (1, N, 2) query points or None.
-    :param device: torch device.
-    :param grid_size: Grid size for automatic point generation (if queries is None).
-    :return: (pred_tracks, pred_visibility)
+    NON-BATCHED version:
+      video:   [T,3,H,W]
+      queries: [1,N,3] (t,x,y)
+    returns:
+      pred_tracks:      [1,T,N,2]
+      pred_visibility:  [1,T,N,1]  (depending on model)
     """
+    model = _get_cotracker(device)
 
-    import os
-    os.environ["TORCH_HOME"] = "/data/users/va11moje/cache/cotracker"
+    video = video.to(device).contiguous()
+    queries = queries.to(device).contiguous()
 
-    model = torch.hub.load("facebookresearch/co-tracker", "cotracker3_offline")
-    model = model.to(device)
-    video = video.to(device)
-    model.model.model_resolution = video.shape[2:]
+    # model expects [1,T,3,H,W]
+    video_b = video.unsqueeze(0)
 
-    
+    # set resolution (if supported)
+    try:
+        model.model.model_resolution = video.shape[-2:]
+    except Exception:
+        pass
+
     pred_tracks, pred_visibility = model(
-        video.unsqueeze(0).to(device),
-        queries=queries.to(device),
+        video_b,
+        queries=queries,
         grid_size=grid_size,
-        grid_query_frame=0,      # ignored when queries is provided, but fine to keep
-        backward_tracking=False
+        grid_query_frame=0,
     )
-
     return pred_tracks, pred_visibility
+
 
 def _crop_or_pad_phi_to_hw(phi_2hw: np.ndarray, H: int, W: int) -> np.ndarray:
     """
