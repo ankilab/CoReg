@@ -24,6 +24,7 @@ class CoTrackerThreeOffline(CoTrackerThreeBase):
         is_train=False,
         add_space_attn=True,
         fmaps_chunk_size=200,
+        progress_cb=None,
     ):
         """Predict tracks
 
@@ -46,6 +47,13 @@ class CoTrackerThreeOffline(CoTrackerThreeBase):
         assert H % self.stride == 0 and W % self.stride == 0
 
         B, N, __ = queries.shape
+
+        def _cb(p, stage, **meta):
+            if progress_cb is not None:
+                progress_cb(float(p), stage=stage, **meta)
+
+        _cb(0.0, "start", T=int(T), N=int(N), iters=int(iters))
+
         # B = batch size
         # S_trimmed = actual number of frames in the window
         # N = number of tracks
@@ -80,15 +88,27 @@ class CoTrackerThreeOffline(CoTrackerThreeBase):
 
         if T > fmaps_chunk_size:
             fmaps = []
+            num_chunks = (T + fmaps_chunk_size - 1) // fmaps_chunk_size
+            chunk_idx = 0
             for t in range(0, T, fmaps_chunk_size):
                 video_chunk = video[:, t : t + fmaps_chunk_size]
                 fmaps_chunk = self.fnet(video_chunk.reshape(-1, C_, H, W))
                 T_chunk = video_chunk.shape[1]
                 C_chunk, H_chunk, W_chunk = fmaps_chunk.shape[1:]
                 fmaps.append(fmaps_chunk.reshape(B, T_chunk, C_chunk, H_chunk, W_chunk))
+                chunk_idx += 1
+                _cb(
+                    0.30 * (chunk_idx / num_chunks),
+                    "fmaps",
+                    chunk=chunk_idx,
+                    num_chunks=num_chunks,
+                )
+
             fmaps = torch.cat(fmaps, dim=1).reshape(-1, C_chunk, H_chunk, W_chunk)
         else:
             fmaps = self.fnet(video.reshape(-1, C_, H, W))
+            _cb(0.30, "fmaps", chunk=1, num_chunks=1)
+
         fmaps = fmaps.permute(0, 2, 3, 1)
         fmaps = fmaps / torch.sqrt(
             torch.maximum(
@@ -214,6 +234,7 @@ class CoTrackerThreeOffline(CoTrackerThreeBase):
             coord_preds.append(coords_append)
             vis_preds.append(torch.sigmoid(vis))
             confidence_preds.append(torch.sigmoid(confidence))
+            _cb(0.30 + 0.70 * ((it + 1) / iters), "iters", it=(it + 1), iters=iters)
 
         if is_train:
             all_coords_predictions.append([coord[..., :2] for coord in coord_preds])
@@ -229,5 +250,7 @@ class CoTrackerThreeOffline(CoTrackerThreeBase):
             )
         else:
             train_data = None
+
+        _cb(1.0, "done")
 
         return coord_preds[-1][..., :2], vis_preds[-1], confidence_preds[-1], train_data

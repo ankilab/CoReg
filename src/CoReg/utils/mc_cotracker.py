@@ -24,9 +24,8 @@ def _get_cotracker(device: str):
     return _COTRACKER
 
 
-
 @torch.inference_mode()
-def cotrack_model(video, queries, device, grid_size=0):
+def cotrack_model(video, queries, device, grid_size=0, progress_cb=None):
     """
     NON-BATCHED version:
       video:   [T,3,H,W]
@@ -49,12 +48,22 @@ def cotrack_model(video, queries, device, grid_size=0):
     except Exception:
         pass
 
-    pred_tracks, pred_visibility = model(
-        video_b,
-        queries=queries,
-        grid_size=grid_size,
-        grid_query_frame=0,
-    )
+    try:
+        pred_tracks, pred_visibility = model(
+            video_b,
+            queries=queries,
+            grid_size=grid_size,
+            grid_query_frame=0,
+            progress_cb=progress_cb,
+        )
+    except TypeError:
+        # Fallback for models that don't accept progress_cb
+        pred_tracks, pred_visibility = model(
+            video_b,
+            queries=queries,
+            grid_size=grid_size,
+            grid_query_frame=0,
+        )
     return pred_tracks, pred_visibility
 
 
@@ -71,7 +80,7 @@ def _crop_or_pad_phi_to_hw(phi_2hw: np.ndarray, H: int, W: int) -> np.ndarray:
     h, w = phi.shape[1], phi.shape[2]
 
     # crop falls nötig
-    phi = phi[:, :min(h, H), :min(w, W)]
+    phi = phi[:, : min(h, H), : min(w, W)]
     h2, w2 = phi.shape[1], phi.shape[2]
 
     # pad falls nötig (unten/rechts), mit edge-replication
@@ -86,7 +95,7 @@ def _crop_or_pad_phi_to_hw(phi_2hw: np.ndarray, H: int, W: int) -> np.ndarray:
 def gaussian_smooth(u, sigma=2.0):
     """Apply Gaussian smoothing to a 2D array."""
     return cv2.GaussianBlur(u.astype(np.float32, copy=False), (0, 0), float(sigma))
-    
+
 
 def warping(predicted_tracks, frames, smoothing=3, callback=None):
     """
@@ -109,11 +118,11 @@ def warping(predicted_tracks, frames, smoothing=3, callback=None):
     frames = np.asarray(frames)
 
     # ---- normalize frames shape ----
-    if frames.ndim == 4 and frames.shape[1] in (1, 3):   # (T,C,H,W)
+    if frames.ndim == 4 and frames.shape[1] in (1, 3):  # (T,C,H,W)
         T_orig, C, H, W = frames.shape
         frame0_gray = frames[0, 0].astype(np.float32)
         get_frame_gray = lambda i: frames[i, 0].astype(np.float32)
-    elif frames.ndim == 4 and frames.shape[-1] in (1, 3): # (T,H,W,C)
+    elif frames.ndim == 4 and frames.shape[-1] in (1, 3):  # (T,H,W,C)
         T_orig, H, W, C = frames.shape
         frame0_gray = frames[0, ..., 0].astype(np.float32)
         get_frame_gray = lambda i: frames[i, ..., 0].astype(np.float32)
@@ -121,9 +130,9 @@ def warping(predicted_tracks, frames, smoothing=3, callback=None):
         raise ValueError(f"Unsupported frames shape: {frames.shape}")
 
     # ---- input range (gray channel 0) ----
-    if frames.ndim == 4 and frames.shape[1] in (1, 3):          # (T,C,H,W)
+    if frames.ndim == 4 and frames.shape[1] in (1, 3):  # (T,C,H,W)
         gray_stack = frames[:, 0].astype(np.float32, copy=False)
-    else:                                                       # (T,H,W,C)
+    else:  # (T,H,W,C)
         gray_stack = frames[..., 0].astype(np.float32, copy=False)
 
     in_min = float(np.nanmin(gray_stack))
@@ -132,7 +141,9 @@ def warping(predicted_tracks, frames, smoothing=3, callback=None):
 
     # clip the reference frame too (optional but keeps everything consistent)
     if do_clip:
-        frame0_gray = np.clip(frame0_gray, in_min, in_max).astype(np.float32, copy=False)
+        frame0_gray = np.clip(frame0_gray, in_min, in_max).astype(
+            np.float32, copy=False
+        )
 
     B, T, G, D = tracks.shape
     if D != 2:
@@ -140,7 +151,9 @@ def warping(predicted_tracks, frames, smoothing=3, callback=None):
     grid_size = int(math.sqrt(G))
 
     if T_orig > T:
-        raise ValueError(f"frames has {T_orig} frames but predicted_tracks has only {T} timesteps")
+        raise ValueError(
+            f"frames has {T_orig} frames but predicted_tracks has only {T} timesteps"
+        )
 
     sigma = float(smoothing) if smoothing is not None else 0.0
 
@@ -161,16 +174,16 @@ def warping(predicted_tracks, frames, smoothing=3, callback=None):
             pts0,
             disp_sparse[t, :, 0],
             (X, Y),
-            method="linear", #cubic
-            fill_value=np.nan
+            method="linear",  # cubic
+            fill_value=np.nan,
         )
 
         dy_lin = griddata(
             pts0,
             disp_sparse[t, :, 1],
             (X, Y),
-            method="linear", #linear
-            fill_value=np.nan
+            method="linear",  # linear
+            fill_value=np.nan,
         )
 
         # NaNs mit nearest auffüllen (pro t!)
@@ -180,20 +193,19 @@ def warping(predicted_tracks, frames, smoothing=3, callback=None):
         dx_dense[t] = np.where(np.isnan(dx_lin), dx_nn, dx_lin).astype(np.float32)
         dy_dense[t] = np.where(np.isnan(dy_lin), dy_nn, dy_lin).astype(np.float32)
 
-
-
     vp = np.stack((dx_dense, dy_dense), axis=1)  # (T,2,H,W)
 
-    grid_x0, grid_y0 = np.meshgrid(np.arange(W, dtype=np.float32),
-                                   np.arange(H, dtype=np.float32))
+    grid_x0, grid_y0 = np.meshgrid(
+        np.arange(W, dtype=np.float32), np.arange(H, dtype=np.float32)
+    )
 
     warpeds = [frame0_gray]
     phis = [np.zeros((H, W, 2), dtype=np.float32)]
 
     for i in range(1, T_orig):
-        
+
         if callback is not None:
-             callback(i / T_orig)
+            callback(i / T_orig)
 
         phi = vp[i]  # (2,h,w) evtl nicht exakt H,W
         phi = _crop_or_pad_phi_to_hw(phi, H, W)  # -> (2,H,W), pad mit Randwert
@@ -207,12 +219,8 @@ def warping(predicted_tracks, frames, smoothing=3, callback=None):
 
         src = get_frame_gray(i).astype(np.float32, copy=False)
 
-
         warped = map_coordinates(
-            src,
-            [sample_y, sample_x],
-            order=2,
-            mode="nearest"   
+            src, [sample_y, sample_x], order=2, mode="nearest"
         ).astype(np.float32)
 
         if do_clip:
@@ -221,10 +229,3 @@ def warping(predicted_tracks, frames, smoothing=3, callback=None):
         warpeds.append(warped)
 
     return np.asarray(warpeds, dtype=np.float32), np.asarray(phis, dtype=np.float32)
-
-
-
-
-
-
-

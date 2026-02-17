@@ -6,6 +6,7 @@
 
 import torch
 import torch.nn.functional as F
+from tqdm import tqdm
 
 from cotracker.models.core.model_utils import smart_cat, get_points_on_a_grid
 from cotracker.models.build_cotracker import build_cotracker
@@ -47,12 +48,57 @@ class CoTrackerPredictor(torch.nn.Module):
         grid_size: int = 0,
         grid_query_frame: int = 0,  # only for dense and regular grid tracks
         backward_tracking: bool = False,
+        progress_cb=None,
     ):
+        class _ProgressBar:
+            def __init__(self):
+                self.inner = None
+                self.outer = None
+
+            def __call__(self, p: float, stage: str, **meta):
+                if stage == "dense_offsets":
+                    total = int(meta.get("total", 100))
+                    offset = int(meta.get("offset", int(p * total)))
+                    if self.outer is None:
+                        self.outer = tqdm(total=total, desc="Offsets", leave=True)
+                    if offset != self.outer.n:
+                        self.outer.update(offset - self.outer.n)
+                    return
+
+                target = max(0, min(100, int(round(float(p) * 100))))
+                desc = {
+                    "start": "Preparing",
+                    "fmaps": "Computing features",
+                    "iters": "Refining tracks",
+                    "done": "Finishing",
+                }.get(stage, stage)
+
+                if self.inner is None:
+                    self.inner = tqdm(total=100, desc=desc, leave=False)
+                else:
+                    if self.inner.desc != desc:
+                        self.inner.set_description(desc)
+
+                if target != self.inner.n:
+                    self.inner.update(target - self.inner.n)
+
+                if stage == "done" and self.inner is not None:
+                    self.inner.close()
+
+            def close(self):
+                if self.inner is not None:
+                    self.inner.close()
+                if self.outer is not None:
+                    self.outer.close()
+
+        if progress_cb is None:
+            progress_cb = _ProgressBar()
         if queries is None and grid_size == 0:
             tracks, visibilities = self._compute_dense_tracks(
                 video,
                 grid_query_frame=grid_query_frame,
                 backward_tracking=backward_tracking,
+                progress_cb=progress_cb,
             )
         else:
             tracks, visibilities = self._compute_sparse_tracks(
@@ -63,22 +109,40 @@ class CoTrackerPredictor(torch.nn.Module):
                 add_support_grid=(grid_size == 0 or segm_mask is not None),
                 grid_query_frame=grid_query_frame,
                 backward_tracking=backward_tracking,
+                progress_cb=progress_cb,
             )
-
+        # Close progress bars if a default callback was created
+        if isinstance(progress_cb, _ProgressBar):
+            progress_cb.close()
         return tracks, visibilities
 
     def _compute_dense_tracks(
-        self, video, grid_query_frame, grid_size=80, backward_tracking=False
+        self,
+        video,
+        grid_query_frame,
+        grid_size=80,
+        backward_tracking=False,
+        progress_cb=None,
     ):
         *_, H, W = video.shape
         grid_step = W // grid_size
         grid_width = W // grid_step
         grid_height = H // grid_step
         tracks = visibilities = None
-        grid_pts = torch.zeros((video.shape[0], grid_width * grid_height, 3)).to(video.device)
+        grid_pts = torch.zeros((video.shape[0], grid_width * grid_height, 3)).to(
+            video.device
+        )
         grid_pts[:, :, 0] = grid_query_frame
         for offset in range(grid_step * grid_step):
-            print(f"step {offset} / {grid_step * grid_step}")
+            if progress_cb is not None:
+                progress_cb(
+                    offset / max(1, (grid_step * grid_step)),
+                    stage="dense_offsets",
+                    offset=offset,
+                    total=(grid_step * grid_step),
+                )
+            else:
+                print(f"step {offset} / {grid_step * grid_step}")
             ox = offset % grid_step
             oy = offset // grid_step
             grid_pts[:, :, 1] = (
@@ -91,6 +155,7 @@ class CoTrackerPredictor(torch.nn.Module):
                 video=video,
                 queries=grid_pts,
                 backward_tracking=backward_tracking,
+                progress_cb=progress_cb,
             )
             tracks = smart_cat(tracks, tracks_step, dim=2)
             visibilities = smart_cat(visibilities, visibilities_step, dim=2)
@@ -106,6 +171,7 @@ class CoTrackerPredictor(torch.nn.Module):
         add_support_grid=False,
         grid_query_frame=0,
         backward_tracking=False,
+        progress_cb=None,
     ):
         B, T, C, H, W = video.shape
 
@@ -155,7 +221,10 @@ class CoTrackerPredictor(torch.nn.Module):
             queries = torch.cat([queries, grid_pts], dim=1)
 
         tracks, visibilities, *_ = self.model.forward(
-            video=video, queries=queries, iters=6
+            video=video,
+            queries=queries,
+            iters=6,
+            progress_cb=progress_cb,
         )
 
         if backward_tracking:
@@ -254,7 +323,9 @@ class CoTrackerOnlinePredictor(torch.nn.Module):
                 )
                 if add_support_grid:
                     grid_pts = get_points_on_a_grid(
-                        self.support_grid_size, self.interp_shape, device=video_chunk.device
+                        self.support_grid_size,
+                        self.interp_shape,
+                        device=video_chunk.device,
                     )
                     grid_pts = torch.cat(
                         [torch.zeros_like(grid_pts[:, :, :1]), grid_pts], dim=2
@@ -269,7 +340,7 @@ class CoTrackerOnlinePredictor(torch.nn.Module):
                     [torch.ones_like(grid_pts[:, :, :1]) * grid_query_frame, grid_pts],
                     dim=2,
                 )
-            
+
             self.queries = queries
             return (None, None)
 
@@ -289,11 +360,11 @@ class CoTrackerOnlinePredictor(torch.nn.Module):
                 video=video_chunk, queries=self.queries, iters=6, is_online=True
             )
         if add_support_grid:
-            tracks = tracks[:,:,:self.N]
-            visibilities = visibilities[:,:,:self.N]
+            tracks = tracks[:, :, : self.N]
+            visibilities = visibilities[:, :, : self.N]
             if not self.v2:
-                confidence = confidence[:,:,:self.N]
-            
+                confidence = confidence[:, :, : self.N]
+
         if not self.v2:
             visibilities = visibilities * confidence
         thr = 0.6
@@ -305,5 +376,5 @@ class CoTrackerOnlinePredictor(torch.nn.Module):
                     (H - 1) / (self.interp_shape[0] - 1),
                 ]
             ),
-            visibilities > thr
+            visibilities > thr,
         )

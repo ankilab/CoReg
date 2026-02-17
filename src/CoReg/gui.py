@@ -350,8 +350,54 @@ class ProcessingWorker(QThread):
                 if isinstance(video_in, torch.Tensor) and video_in.shape[1] == 1:
                     video_in = video_in.repeat(1, 3, 1, 1)
 
+                # Progress mapping: CoTracker reports stages (start,fmaps,iters,done) and dense_offsets
+                # Add finer-grained status text using meta like chunk/num_chunks and it/iters
+                def tracker_cb(p: float, stage: str, **meta):
+                    if not self._is_running:
+                        return
+                    # Map model progress [0..1] to 0..70 in GUI
+                    if stage == "dense_offsets":
+                        total = int(meta.get("total", 1))
+                        offset = int(meta.get("offset", 0))
+                        frac = (offset + 1) / max(1, total)
+                        val = int(min(70, max(0, round(frac * 70))))
+                        self.progress.emit(val)
+                        self.status_update.emit(
+                            f"Tracking dense grid ({offset+1}/{total})..."
+                        )
+                        return
+
+                    stage_text = {
+                        "start": "Preparing tracking...",
+                        "fmaps": "Computing features...",
+                        "iters": "Refining tracks...",
+                        "done": "Tracking done",
+                    }.get(stage, f"Tracking: {stage}")
+
+                    val = int(min(70, max(0, round(float(p) * 70))))
+                    self.progress.emit(val)
+
+                    # Enhance status with granular counters when available
+                    if stage == "fmaps":
+                        chunk = int(meta.get("chunk", 0))
+                        num_chunks = int(meta.get("num_chunks", 0))
+                        if num_chunks > 0:
+                            stage_text = (
+                                f"Computing features (chunk {chunk}/{num_chunks})..."
+                            )
+                    elif stage == "iters":
+                        it = int(meta.get("it", 0))
+                        iters = int(meta.get("iters", 0))
+                        if iters > 0:
+                            stage_text = f"Refining tracks (iter {it}/{iters})..."
+
+                    self.status_update.emit(stage_text)
+
                 pred_tracks, pred_visibility = cotrack_model(
-                    video_in, queries=queries, device=DEFAULT_DEVICE
+                    video_in,
+                    queries=queries,
+                    device=DEFAULT_DEVICE,
+                    progress_cb=tracker_cb,
                 )
 
                 tracks_raw = pred_tracks.detach().cpu().numpy()
