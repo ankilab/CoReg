@@ -1,14 +1,11 @@
 import os
-
-import ants
 import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
 from cotracker.utils.visualizer import read_video_from_path
 from scipy.ndimage import map_coordinates
-
-import utils.torch_lddmm as torch_lddmm
+import utils.lddmm_wrapper as lddmm_wrapper
 
 
 def load_video(file, size=(256, 256)):
@@ -28,6 +25,7 @@ def load_video(file, size=(256, 256)):
 
     return video_tensor, video_frames
 
+
 def integrate_field(v, num_steps=10):
     """
     Forward-integrate a velocity field v(x,t) over [0,1].
@@ -46,12 +44,13 @@ def integrate_field(v, num_steps=10):
     dt = 1.0 / num_steps
     for _ in range(num_steps):
         # Euler step: phi_{t+dt} = phi_t + dt * v(phi_t)
-        vx = map_coordinates(v[0], [phi_y, phi_x], order=1, mode='nearest')
-        vy = map_coordinates(v[1], [phi_y, phi_x], order=1, mode='nearest')
+        vx = map_coordinates(v[0], [phi_y, phi_x], order=1, mode="nearest")
+        vy = map_coordinates(v[1], [phi_y, phi_x], order=1, mode="nearest")
         phi_x += dt * vx
         phi_y += dt * vy
 
     return np.stack([phi_x, phi_y], axis=0)
+
 
 def register_lddmm(fixed, moving):
     """
@@ -60,8 +59,8 @@ def register_lddmm(fixed, moving):
     :param moving: Source/template frame.
     :return: Warped numpy array.
     """
-    
-    lddmm = torch_lddmm.LDDMM(
+
+    lddmm = lddmm_wrapper.LDDMM(
         template=[moving],
         target=[fixed],
         do_affine=0,
@@ -75,13 +74,12 @@ def register_lddmm(fixed, moving):
         optimizer="gdr",
         gpu_number=0,
         verbose=False,
-        dx=None
+        dx=None,
     )
-    
-    
 
     result = lddmm.run()
     return lddmm.outputDeformedTemplate()[0]
+
 
 def lddmm_registration(frames):
     """
@@ -90,17 +88,20 @@ def lddmm_registration(frames):
     :return: List of warped numpy arrays.
     """
     lddmm_registrations = [frames[0]]
-    for i in range(1,len(frames)):
+    for i in range(1, len(frames)):
         reg = register_lddmm(frames[0], frames[i])
         lddmm_registrations.append(reg)
-    
+
     return lddmm_registrations
+
 
 def save_and_display_video(array, filename="output.mp4", fps=30):
     """Save a grayscale registration result to MP4."""
 
     if len(array.shape) >= 3:
-        array = array[..., 0]  # Assuming the last dimension is color channels, take the first channel
+        array = array[
+            ..., 0
+        ]  # Assuming the last dimension is color channels, take the first channel
     num_frames, height, width = array.shape
 
     # Normalize and convert to uint8 if needed
@@ -111,7 +112,7 @@ def save_and_display_video(array, filename="output.mp4", fps=30):
         array = np.clip(array, 0, 255).astype(np.uint8)
 
     # VideoWriter setup
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     out = cv2.VideoWriter(filename, fourcc, fps, (width, height), isColor=True)
 
     for i in range(num_frames):
@@ -122,12 +123,13 @@ def save_and_display_video(array, filename="output.mp4", fps=30):
     out.release()
     print(f"Video saved to {filename}")
 
+
 if __name__ == "__main__":
     torch.cuda.empty_cache()
-    
-    #define the video file path
+
+    # define the video file path
     video_file = "/home/rzlin/va11moje/co-tracker/input/Drosophila_Ca_bad.avi"
-    filename = (video_file.split('/')[-1].split('.')[0])
+    filename = video_file.split("/")[-1].split(".")[0]
     if not os.path.exists(video_file):
         print(f"Video file {video_file} does not exist.")
     else:
@@ -139,6 +141,6 @@ if __name__ == "__main__":
     vid, video_frames = load_video(video_file, size=(256, 256))
     frames = np.array(video_frames)
     result = lddmm_registration(frames)
-    save_and_display_video(np.array(result), f'output/{filename}_lddm_registered.mp4', fps=15)
-
-
+    save_and_display_video(
+        np.array(result), f"output/{filename}_lddm_registered.mp4", fps=15
+    )

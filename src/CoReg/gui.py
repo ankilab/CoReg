@@ -14,6 +14,8 @@ from PyQt6.QtWidgets import (
     QSizePolicy,
     QDialog,
     QScrollArea,
+    QComboBox,
+    QFileDialog,
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QThread, QPointF
 from PyQt6.QtGui import QPainter, QColor, QPolygonF, QPen
@@ -21,6 +23,8 @@ import pyqtgraph as pg
 
 # Local imports
 from utils.mc_cotracker import cotrack_model, warping
+import utils.pyflowreg_wrapper as pyflowreg_wrapper
+import utils.normcorre_wrapper as normcorre_wrapper
 
 # Configure pyqtgraph to use row-major ordering (matching numpy)
 pg.setConfigOptions(imageAxisOrder="row-major")
@@ -31,9 +35,9 @@ except ImportError:
     ants = None
 
 try:
-    import utils.torch_lddmm as torch_lddmm
+    import utils.lddmm_wrapper as lddmm_wrapper
 except ImportError:
-    torch_lddmm = None
+    lddmm_wrapper = None
 
 DEFAULT_DEVICE = (
     "cuda"
@@ -45,7 +49,7 @@ DEFAULT_DEVICE = (
 class ProcessingWorker(QThread):
     """
     Background worker that handles computationally intensive video registration.
-    Supports three methods:
+        Supports registration methods:
       - ANTs: Robust, intensity-based registration (requires antspyx).
       - LDDMM: Diffeomorphic registration (uses local torch implementation).
       - CoTracker: Point-based tracking combined with sparse-to-dense warping.
@@ -68,13 +72,16 @@ class ProcessingWorker(QThread):
         video_out=None,
         base_grid_pts=None,
         custom_grid_pts=None,
-        df_sigma=3.0,
+        df_sigma=5.0,
         tracks=None,
         parent=None,
         method="CoTracker",
         filter_name=None,
         existing_data=None,
         queries=None,
+        ants_params=None,
+        normcorre_params=None,
+        pyflowreg_params=None,
     ):
         super().__init__(parent)
 
@@ -90,6 +97,9 @@ class ProcessingWorker(QThread):
         # Stored for future use if merging is needed in the background
         self.existing_data = existing_data
         self.queries = queries  # torch.Tensor of shape (1, N, 2) or None
+        self.ants_params = ants_params or {}
+        self.normcorre_params = normcorre_params or {}
+        self.pyflowreg_params = pyflowreg_params or {}
 
         self._is_running = True
 
@@ -113,7 +123,8 @@ class ProcessingWorker(QThread):
                         "ANTs is not installed. Please install it with 'pip install antspyx'"
                     )
 
-                self.status_update.emit("Running ANTs registration...")
+                ants_tform = self.ants_params.get("type_of_transform", "SyNOnly")
+                self.status_update.emit(f"Running ANTs registration ({ants_tform})...")
                 # Registration sources
                 vd_reg = self.video_in
                 if isinstance(vd_reg, torch.Tensor):
@@ -161,11 +172,30 @@ class ProcessingWorker(QThread):
 
                     moving_image = ants.from_numpy(moving_frame)
 
-                    reg = ants.registration(
-                        fixed=fixed_image,
-                        moving=moving_image,
-                        type_of_transform="SyNOnly",
-                    )
+                    reg_kwargs = {
+                        "fixed": fixed_image,
+                        "moving": moving_image,
+                        "type_of_transform": ants_tform,
+                    }
+
+                    aff_metric = self.ants_params.get("aff_metric")
+                    if aff_metric:
+                        reg_kwargs["aff_metric"] = aff_metric
+
+                    syn_metric = self.ants_params.get("syn_metric")
+                    if syn_metric:
+                        reg_kwargs["syn_metric"] = syn_metric
+
+                    reg_iterations = self.ants_params.get("reg_iterations")
+                    if reg_iterations is not None:
+                        try:
+                            reg_kwargs["reg_iterations"] = [
+                                int(v) for v in reg_iterations
+                            ]
+                        except (TypeError, ValueError):
+                            pass
+
+                    reg = ants.registration(**reg_kwargs)
 
                     # Apply transform to vd_out[i]
                     to_warp = vd_out[i]
@@ -194,7 +224,7 @@ class ProcessingWorker(QThread):
             # ---------- LDDMM REGISTRATION ----------
             # Large Deformation Diffeomorphic Metric Mapping. Uses a local torch-based implementation.
             if self.method == "LDDMM":
-                if torch_lddmm is None:
+                if lddmm_wrapper is None:
                     raise ImportError(
                         "torch_lddmm is not available. Please ensure utils/torch_lddmm.py exists."
                     )
@@ -242,7 +272,7 @@ class ProcessingWorker(QThread):
                         else:
                             moving_frame = moving_frame[:, :, 0]
 
-                    lddmm = torch_lddmm.LDDMM(
+                    lddmm = lddmm_wrapper.LDDMM(
                         template=[moving_frame],
                         target=[ref_frame],
                         do_affine=0,
@@ -259,14 +289,8 @@ class ProcessingWorker(QThread):
                     )
                     lddmm.run()
 
-                    # Apply displacement to vd_out[i]
-                    disp = lddmm.outputDisplacement()
-                    to_warp = vd_out[i]
-                    if to_warp.ndim == 3 and to_warp.shape[-1] == 1:
-                        # torch_lddmm.applyDisplacement usually wants (H,W) or (C,H,W)
-                        to_warp = to_warp[:, :, 0]
-
-                    warped = lddmm.applyDisplacement(to_warp, disp)
+                    # Use the class API: outputDeformedTemplate returns the warped template.
+                    warped = lddmm.outputDeformedTemplate()[0]
 
                     if vd_out[i].ndim == 3 and vd_out[i].shape[-1] == 1:
                         warped = warped[..., None]
@@ -277,6 +301,80 @@ class ProcessingWorker(QThread):
                 self.progress.emit(100)
                 self.status_update.emit("Done")
                 self.finished.emit(None, None, None, None, warped_np, None)
+                return
+
+            # ---------- FlowReg REGISTRATION ----------
+            # Dense optical-flow-based frame-to-reference registration.
+            if self.method == "FlowReg":
+                self.status_update.emit("Running FlowReg registration...")
+
+                vd_out = self.video_out
+                if isinstance(vd_out, torch.Tensor):
+                    vd_out = vd_out.detach().cpu().numpy()
+                if vd_out.ndim == 4 and vd_out.shape[1] in [1, 3]:
+                    vd_out = np.transpose(vd_out, (0, 2, 3, 1))
+
+                def flow_cb(frac):
+                    if not self._is_running:
+                        return
+                    self.progress.emit(int(min(100, max(0, round(float(frac) * 100)))))
+
+                # Extract PyFlowReg parameters from dialog with defaults
+                fr_params = self.pyflowreg_params or {}
+                warped_np, disp_arr = pyflowreg_wrapper.register_video(
+                    vd_out,
+                    reference_index=0,
+                    callback=flow_cb,
+                    alpha=fr_params.get("alpha", 1.5),
+                    min_level=fr_params.get("min_level", 4),
+                    buffer_size=fr_params.get("buffer_size", 100),
+                    save_w=fr_params.get("save_w", True),
+                )
+
+                if not self._is_running:
+                    return
+
+                self.progress.emit(100)
+                self.status_update.emit("Done")
+                self.finished.emit(None, None, None, None, warped_np, disp_arr)
+                return
+
+            # ---------- NoRMCorre REGISTRATION ----------
+            # NoRMCorre-style piecewise-rigid registration (local patch shifts).
+            if self.method == "NoRMCorre":
+                self.status_update.emit("Running NoRMCorre registration...")
+
+                vd_out = self.video_out
+                if isinstance(vd_out, torch.Tensor):
+                    vd_out = vd_out.detach().cpu().numpy()
+                if vd_out.ndim == 4 and vd_out.shape[1] in [1, 3]:
+                    vd_out = np.transpose(vd_out, (0, 2, 3, 1))
+
+                def nc_cb(frac):
+                    if not self._is_running:
+                        return
+                    self.progress.emit(int(min(100, max(0, round(float(frac) * 100)))))
+
+                # Extract NoRMCorre parameters from dialog with defaults
+                nc_params = self.normcorre_params or {}
+                warped_np, disp_arr = normcorre_wrapper.register_video(
+                    vd_out,
+                    reference_index=0,
+                    callback=nc_cb,
+                    pw_rigid=nc_params.get("pw_rigid", True),
+                    max_shifts=nc_params.get("max_shifts", (6, 6)),
+                    strides=nc_params.get("strides", (96, 96)),
+                    overlaps=nc_params.get("overlaps", (32, 32)),
+                    upsample_factor_fft=nc_params.get("upsample_factor_fft", 4),
+                    max_deviation_rigid=nc_params.get("max_deviation_rigid", 3),
+                )
+
+                if not self._is_running:
+                    return
+
+                self.progress.emit(100)
+                self.status_update.emit("Done")
+                self.finished.emit(None, None, None, None, warped_np, disp_arr)
                 return
 
             # ---------- CoTracker + Warping ----------
@@ -480,7 +578,11 @@ class ProcessingWorker(QThread):
             if not self._is_running:
                 return
 
-            warped_np = np.asarray(warped_video)
+            warped_np = (
+                warped_video.detach().cpu().numpy()
+                if isinstance(warped_video, torch.Tensor)
+                else np.asarray(warped_video)
+            )
             if warped_np.ndim >= 4 and warped_np.shape[0] == 1:
                 warped_np = warped_np[0]
 
@@ -857,8 +959,16 @@ class PGImagePanel(pg.GraphicsLayoutWidget):
             return False
 
         x, y = xy
-        # Check scatter points
+        # Check scatter points (supports both x/y arrays and spot-based data)
         pts_x, pts_y = self.points_item.getData()
+        if pts_x is None or pts_y is None:
+            spots = self.points_item.points()
+            if spots:
+                pts = np.array([[s.pos().x(), s.pos().y()] for s in spots], dtype=float)
+                pts_x, pts_y = pts[:, 0], pts[:, 1]
+            else:
+                pts_x, pts_y = np.array([]), np.array([])
+
         if len(pts_x) > 0:
             p0 = self.vb.mapSceneToView(pg.Point(0, 0))
             p1 = self.vb.mapSceneToView(pg.Point(10, 0))  # 10 screen pixels
@@ -870,6 +980,9 @@ class PGImagePanel(pg.GraphicsLayoutWidget):
 
         # Check crosses
         c_x, c_y = self.cross_item.getData()
+        if c_x is None or c_y is None:
+            c_x, c_y = np.array([]), np.array([])
+
         if len(c_x) > 0:
             p0 = self.vb.mapSceneToView(pg.Point(0, 0))
             p1 = self.vb.mapSceneToView(pg.Point(10, 0))
@@ -1170,6 +1283,292 @@ class ParameterDialog(QDialog):
         self.close_btn = QPushButton("Close")
         self.close_btn.clicked.connect(self.hide)
         outer.addWidget(self.close_btn)
+
+
+class AntsRegistrationDialog(QDialog):
+    """Dialog for selecting ANTs registration parameters."""
+
+    def __init__(self, parent=None, current=None):
+        super().__init__(parent)
+        self.setWindowTitle("ANTs Parameters")
+
+        current = current or {}
+
+        layout = QVBoxLayout(self)
+
+        tform_row = QHBoxLayout()
+        tform_row.addWidget(QLabel("Transform:"))
+        self.transform_combo = QComboBox()
+        self.transform_combo.addItems(
+            [
+                "SyNOnly",
+                "SyN",
+                "Affine",
+                "Rigid",
+                "Translation",
+                "Similarity",
+                "TRSAA",
+            ]
+        )
+        self.transform_combo.setCurrentText(
+            str(current.get("type_of_transform", "SyNOnly"))
+        )
+        tform_row.addWidget(self.transform_combo)
+        layout.addLayout(tform_row)
+
+        aff_row = QHBoxLayout()
+        aff_row.addWidget(QLabel("Affine metric:"))
+        self.aff_metric_combo = QComboBox()
+        self.aff_metric_combo.addItems(["mattes", "meansquares", "GC"])
+        self.aff_metric_combo.setCurrentText(str(current.get("aff_metric", "mattes")))
+        aff_row.addWidget(self.aff_metric_combo)
+        layout.addLayout(aff_row)
+
+        syn_row = QHBoxLayout()
+        syn_row.addWidget(QLabel("SyN metric:"))
+        self.syn_metric_combo = QComboBox()
+        self.syn_metric_combo.addItems(["mattes", "meansquares", "CC", "demons"])
+        self.syn_metric_combo.setCurrentText(str(current.get("syn_metric", "mattes")))
+        syn_row.addWidget(self.syn_metric_combo)
+        layout.addLayout(syn_row)
+
+        iter_vals = current.get("reg_iterations", [40, 20, 0])
+        if not isinstance(iter_vals, (list, tuple)) or len(iter_vals) < 3:
+            iter_vals = [40, 20, 0]
+
+        it_row = QHBoxLayout()
+        it_row.addWidget(QLabel("Reg iterations (coarse, mid, fine):"))
+        self.iter1_spin = QSpinBox()
+        self.iter2_spin = QSpinBox()
+        self.iter3_spin = QSpinBox()
+        for s in (self.iter1_spin, self.iter2_spin, self.iter3_spin):
+            s.setRange(0, 10000)
+        self.iter1_spin.setValue(int(iter_vals[0]))
+        self.iter2_spin.setValue(int(iter_vals[1]))
+        self.iter3_spin.setValue(int(iter_vals[2]))
+        it_row.addWidget(QLabel("Coarse"))
+        it_row.addWidget(self.iter1_spin)
+        it_row.addWidget(QLabel("Mid"))
+        it_row.addWidget(self.iter2_spin)
+        it_row.addWidget(QLabel("Fine"))
+        it_row.addWidget(self.iter3_spin)
+        layout.addLayout(it_row)
+
+        btn_row = QHBoxLayout()
+        ok_btn = QPushButton("OK")
+        cancel_btn = QPushButton("Cancel")
+        ok_btn.clicked.connect(self.accept)
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(ok_btn)
+        btn_row.addWidget(cancel_btn)
+        layout.addLayout(btn_row)
+
+    def result_params(self):
+        return {
+            "type_of_transform": self.transform_combo.currentText(),
+            "aff_metric": self.aff_metric_combo.currentText(),
+            "syn_metric": self.syn_metric_combo.currentText(),
+            "reg_iterations": [
+                int(self.iter1_spin.value()),
+                int(self.iter2_spin.value()),
+                int(self.iter3_spin.value()),
+            ],
+        }
+
+
+class NormCorreDialog(QDialog):
+    """Dialog for adjusting NoRMCorre registration parameters."""
+
+    def __init__(self, parent=None, current=None):
+        super().__init__(parent)
+        self.setWindowTitle("NoRMCorre Parameters")
+
+        current = current or {}
+
+        layout = QVBoxLayout(self)
+
+        # pw_rigid option
+        pw_rigid_row = QHBoxLayout()
+        pw_rigid_row.addWidget(QLabel("Piecewise rigid:"))
+        self.pw_rigid_chk = QCheckBox()
+        self.pw_rigid_chk.setChecked(current.get("pw_rigid", True))
+        pw_rigid_row.addWidget(self.pw_rigid_chk)
+        pw_rigid_row.addStretch()
+        layout.addLayout(pw_rigid_row)
+
+        # max_shifts (row, col)
+        shifts_row = QHBoxLayout()
+        shifts_row.addWidget(QLabel("Max shifts (row, col):"))
+        self.max_shifts_row_spin = QSpinBox()
+        self.max_shifts_col_spin = QSpinBox()
+        for s in (self.max_shifts_row_spin, self.max_shifts_col_spin):
+            s.setRange(1, 100)
+        max_shifts = current.get("max_shifts", (6, 6))
+        self.max_shifts_row_spin.setValue(int(max_shifts[0]))
+        self.max_shifts_col_spin.setValue(int(max_shifts[1]))
+        shifts_row.addWidget(QLabel("Row:"))
+        shifts_row.addWidget(self.max_shifts_row_spin)
+        shifts_row.addWidget(QLabel("Col:"))
+        shifts_row.addWidget(self.max_shifts_col_spin)
+        layout.addLayout(shifts_row)
+
+        # strides (row, col)
+        strides_row = QHBoxLayout()
+        strides_row.addWidget(QLabel("Strides (row, col):"))
+        self.strides_row_spin = QSpinBox()
+        self.strides_col_spin = QSpinBox()
+        for s in (self.strides_row_spin, self.strides_col_spin):
+            s.setRange(1, 500)
+        strides = current.get("strides", (96, 96))
+        self.strides_row_spin.setValue(int(strides[0]))
+        self.strides_col_spin.setValue(int(strides[1]))
+        strides_row.addWidget(QLabel("Row:"))
+        strides_row.addWidget(self.strides_row_spin)
+        strides_row.addWidget(QLabel("Col:"))
+        strides_row.addWidget(self.strides_col_spin)
+        layout.addLayout(strides_row)
+
+        # overlaps (row, col)
+        overlaps_row = QHBoxLayout()
+        overlaps_row.addWidget(QLabel("Overlaps (row, col):"))
+        self.overlaps_row_spin = QSpinBox()
+        self.overlaps_col_spin = QSpinBox()
+        for s in (self.overlaps_row_spin, self.overlaps_col_spin):
+            s.setRange(0, 500)
+        overlaps = current.get("overlaps", (32, 32))
+        self.overlaps_row_spin.setValue(int(overlaps[0]))
+        self.overlaps_col_spin.setValue(int(overlaps[1]))
+        overlaps_row.addWidget(QLabel("Row:"))
+        overlaps_row.addWidget(self.overlaps_row_spin)
+        overlaps_row.addWidget(QLabel("Col:"))
+        overlaps_row.addWidget(self.overlaps_col_spin)
+        layout.addLayout(overlaps_row)
+
+        # upsample_factor_fft
+        upsample_row = QHBoxLayout()
+        upsample_row.addWidget(QLabel("Upsample factor (FFT):"))
+        self.upsample_spin = QSpinBox()
+        self.upsample_spin.setRange(1, 20)
+        self.upsample_spin.setValue(int(current.get("upsample_factor_fft", 4)))
+        upsample_row.addWidget(self.upsample_spin)
+        upsample_row.addStretch()
+        layout.addLayout(upsample_row)
+
+        # max_deviation_rigid
+        deviation_row = QHBoxLayout()
+        deviation_row.addWidget(QLabel("Max deviation (rigid):"))
+        self.deviation_spin = QSpinBox()
+        self.deviation_spin.setRange(1, 50)
+        self.deviation_spin.setValue(int(current.get("max_deviation_rigid", 3)))
+        deviation_row.addWidget(self.deviation_spin)
+        deviation_row.addStretch()
+        layout.addLayout(deviation_row)
+
+        # Buttons
+        btn_row = QHBoxLayout()
+        ok_btn = QPushButton("OK")
+        cancel_btn = QPushButton("Cancel")
+        ok_btn.clicked.connect(self.accept)
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(ok_btn)
+        btn_row.addWidget(cancel_btn)
+        layout.addLayout(btn_row)
+
+    def result_params(self):
+        return {
+            "pw_rigid": self.pw_rigid_chk.isChecked(),
+            "max_shifts": (
+                int(self.max_shifts_row_spin.value()),
+                int(self.max_shifts_col_spin.value()),
+            ),
+            "strides": (
+                int(self.strides_row_spin.value()),
+                int(self.strides_col_spin.value()),
+            ),
+            "overlaps": (
+                int(self.overlaps_row_spin.value()),
+                int(self.overlaps_col_spin.value()),
+            ),
+            "upsample_factor_fft": int(self.upsample_spin.value()),
+            "max_deviation_rigid": int(self.deviation_spin.value()),
+        }
+
+
+class PyFlowRegDialog(QDialog):
+    """Dialog for adjusting PyFlowReg registration parameters."""
+
+    def __init__(self, parent=None, current=None):
+        super().__init__(parent)
+        self.setWindowTitle("PyFlowReg Parameters")
+
+        current = current or {}
+
+        layout = QVBoxLayout(self)
+
+        # alpha (regularization strength)
+        alpha_row = QHBoxLayout()
+        alpha_row.addWidget(QLabel("Alpha (regularization):"))
+        self.alpha_spin = QSpinBox()
+        self.alpha_spin.setRange(1, 50)
+        # Use decimal display with 1 decimal place via property
+        self.alpha_spin.setProperty("_alpha_scale", 10)
+        alpha_val = float(current.get("alpha", 1.5))
+        self.alpha_spin.setValue(int(alpha_val * 10))
+        self.alpha_label = QLabel(f"{alpha_val:.1f}")
+        self.alpha_spin.valueChanged.connect(
+            lambda v: self.alpha_label.setText(f"{v/10:.1f}")
+        )
+        alpha_row.addWidget(self.alpha_spin)
+        alpha_row.addWidget(self.alpha_label)
+        alpha_row.addStretch()
+        layout.addLayout(alpha_row)
+
+        # min_level (pyramid level)
+        min_level_row = QHBoxLayout()
+        min_level_row.addWidget(QLabel("Min level (pyramid):"))
+        self.min_level_spin = QSpinBox()
+        self.min_level_spin.setRange(1, 10)
+        self.min_level_spin.setValue(int(current.get("min_level", 4)))
+        min_level_row.addWidget(self.min_level_spin)
+        min_level_row.addStretch()
+        layout.addLayout(min_level_row)
+
+        # buffer_size
+        buffer_row = QHBoxLayout()
+        buffer_row.addWidget(QLabel("Buffer size:"))
+        self.buffer_spin = QSpinBox()
+        self.buffer_spin.setRange(10, 500)
+        self.buffer_spin.setValue(int(current.get("buffer_size", 100)))
+        buffer_row.addWidget(self.buffer_spin)
+        buffer_row.addStretch()
+        layout.addLayout(buffer_row)
+
+        # save_w (save displacement fields)
+        save_w_row = QHBoxLayout()
+        save_w_row.addWidget(QLabel("Save displacement fields:"))
+        self.save_w_chk = QCheckBox()
+        self.save_w_chk.setChecked(current.get("save_w", True))
+        save_w_row.addWidget(self.save_w_chk)
+        save_w_row.addStretch()
+        layout.addLayout(save_w_row)
+
+        # Buttons
+        btn_row = QHBoxLayout()
+        ok_btn = QPushButton("OK")
+        cancel_btn = QPushButton("Cancel")
+        ok_btn.clicked.connect(self.accept)
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(ok_btn)
+        btn_row.addWidget(cancel_btn)
+        layout.addLayout(btn_row)
+
+    def result_params(self):
+        return {
+            "alpha": self.alpha_spin.value() / 10.0,
+            "min_level": int(self.min_level_spin.value()),
+            "buffer_size": int(self.buffer_spin.value()),
+            "save_w": self.save_w_chk.isChecked(),
+        }
 
 
 class VideoLoadSettingsDialog(QDialog):

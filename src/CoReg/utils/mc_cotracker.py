@@ -97,135 +97,219 @@ def gaussian_smooth(u, sigma=2.0):
     return cv2.GaussianBlur(u.astype(np.float32, copy=False), (0, 0), float(sigma))
 
 
-def warping(predicted_tracks, frames, smoothing=3, callback=None):
+def warp_like_numpy(
+    src_hw: torch.Tensor, flow_2hw: torch.Tensor, mode: str = "bilinear"
+):
     """
-    Apply motion correction by warping frames according to predicted tracks.
-
-    :param predicted_tracks: (B, T, G, 2) array of point tracks.
-    :param frames: (T, C, H, W) or (T, H, W, C) video data.
-    :param smoothing: Sigma for Gaussian smoothing of the displacement field.
-    :param callback: Optional function(float) for progress reporting.
-    :return: (warped_frames, displacement_fields)
+    src_hw: (H,W)
+    flow_2hw: (2,H,W) where flow[0]=dx, flow[1]=dy in *pixels*
     """
+    H, W = src_hw.shape
+    device, dtype = src_hw.device, src_hw.dtype
 
-    # ---- to numpy ----
-    if torch.is_tensor(predicted_tracks):
-        predicted_tracks = predicted_tracks.detach().cpu().numpy()
-    if torch.is_tensor(frames):
-        frames = frames.detach().cpu().numpy()
+    yy, xx = torch.meshgrid(
+        torch.arange(H, device=device, dtype=dtype),
+        torch.arange(W, device=device, dtype=dtype),
+        indexing="ij",
+    )
 
-    tracks = np.asarray(predicted_tracks)
-    frames = np.asarray(frames)
+    x = xx + flow_2hw[0]
+    y = yy + flow_2hw[1]
 
-    # ---- normalize frames shape ----
-    if frames.ndim == 4 and frames.shape[1] in (1, 3):  # (T,C,H,W)
-        T_orig, C, H, W = frames.shape
-        frame0_gray = frames[0, 0].astype(np.float32)
-        get_frame_gray = lambda i: frames[i, 0].astype(np.float32)
-    elif frames.ndim == 4 and frames.shape[-1] in (1, 3):  # (T,H,W,C)
-        T_orig, H, W, C = frames.shape
-        frame0_gray = frames[0, ..., 0].astype(np.float32)
-        get_frame_gray = lambda i: frames[i, ..., 0].astype(np.float32)
+    # normalize for grid_sample, align_corners=True matches pixel indexing
+    x_norm = 2.0 * (x / (W - 1)) - 1.0
+    y_norm = 2.0 * (y / (H - 1)) - 1.0
+    grid = torch.stack([x_norm, y_norm], dim=-1)[None]  # (1,H,W,2)
+
+    src = src_hw[None, None]  # (1,1,H,W)
+    out = F.grid_sample(
+        src,
+        grid,
+        mode=mode,  # 'bilinear' or 'bicubic'
+        padding_mode="border",  # closest to SciPy "nearest" border extension
+        align_corners=True,
+    )
+    return out[0, 0]
+
+
+def idw_dense_flow(
+    pts_xy: torch.Tensor,  # (G,2) in pixels (x,y)
+    disp_g2: torch.Tensor,  # (G,2)
+    H: int,
+    W: int,
+    k: int = 16,
+    power: float = 2.0,
+    eps: float = 1e-6,
+    chunk: int = 65536,
+):
+    """
+    Dense IDW interpolation of a sparse displacement field.
+    Returns (2,H,W) flow in pixels.
+    """
+    if pts_xy.ndim != 2 or pts_xy.shape[-1] != 2:
+        raise ValueError(f"pts_xy must be (G,2), got {tuple(pts_xy.shape)}")
+    if disp_g2.ndim != 2 or disp_g2.shape[-1] != 2:
+        raise ValueError(f"disp_g2 must be (G,2), got {tuple(disp_g2.shape)}")
+    G = pts_xy.shape[0]
+    if G == 0:
+        raise ValueError("No sparse points (G==0). Cannot interpolate flow.")
+    if disp_g2.shape[0] != G:
+        raise ValueError(f"pts_xy has G={G} but disp_g2 has {disp_g2.shape[0]}")
+
+    # clamp k
+    k_eff = int(min(max(1, k), G))
+
+    device, dtype = pts_xy.device, pts_xy.dtype
+
+    yy, xx = torch.meshgrid(
+        torch.arange(H, device=device, dtype=dtype),
+        torch.arange(W, device=device, dtype=dtype),
+        indexing="ij",
+    )
+    q = torch.stack([xx.reshape(-1), yy.reshape(-1)], dim=-1)  # (N,2)
+    out = torch.empty((q.shape[0], 2), device=device, dtype=dtype)
+
+    for s in range(0, q.shape[0], chunk):
+        qe = q[s : s + chunk]  # (M,2)
+
+        # distances (M,G)
+        d = torch.cdist(qe, pts_xy).clamp_min(eps)
+
+        if k_eff == 1:
+            # nearest neighbor special-case
+            idx = d.argmin(dim=1)
+            out[s : s + chunk] = disp_g2[idx]
+            continue
+
+        knn_d, knn_idx = torch.topk(d, k=k_eff, dim=1, largest=False)  # (M,k)
+        w = 1.0 / (knn_d**power)
+        w = w / w.sum(dim=1, keepdim=True).clamp_min(eps)
+
+        disp_knn = disp_g2[knn_idx]  # (M,k,2)
+        out[s : s + chunk] = (disp_knn * w.unsqueeze(-1)).sum(dim=1)
+
+    flow_hw2 = out.view(H, W, 2)
+    return flow_hw2.permute(2, 0, 1).contiguous()  # (2,H,W)
+
+
+def gaussian_blur_2hw(flow_2hw: torch.Tensor, sigma: float):
+    if sigma is None or sigma <= 0:
+        return flow_2hw
+    # simple kernel size rule
+    radius = int(max(1, round(3 * sigma)))
+    k = 2 * radius + 1
+    device, dtype = flow_2hw.device, flow_2hw.dtype
+
+    x = torch.arange(-radius, radius + 1, device=device, dtype=dtype)
+    g = torch.exp(-(x * x) / (2 * sigma * sigma))
+    g = g / g.sum()
+
+    # separable conv
+    flow = flow_2hw[None]  # (1,2,H,W)
+    # horizontal
+    gh = g.view(1, 1, 1, k).repeat(2, 1, 1, 1)  # (2,1,1,k)
+    flow = F.pad(flow, (radius, radius, 0, 0), mode="replicate")
+    flow = F.conv2d(flow, gh, groups=2)
+    # vertical
+    gv = g.view(1, 1, k, 1).repeat(2, 1, 1, 1)  # (2,1,k,1)
+    flow = F.pad(flow, (0, 0, radius, radius), mode="replicate")
+    flow = F.conv2d(flow, gv, groups=2)
+
+    return flow[0]
+
+
+def warping(
+    predicted_tracks,
+    frames,
+    smoothing=5.0,
+    k=16,
+    power=1.5,
+    mode="bilinear",
+    callback=None,
+):
+    """
+    predicted_tracks: (B,T,G,2) in pixel coords (x,y)
+    frames: (T,C,H,W) or (T,H,W,C)
+    Returns:
+      warped: (T,H,W) grayscale
+      flows:  (T,H,W,2) dense flow (dx,dy) in pixels
+    """
+    tracks = predicted_tracks.float()
+    frames_t = frames.float()
+
+    # normalize to (T,C,H,W)
+    if frames_t.ndim == 4 and frames_t.shape[1] in (1, 3):
+        T_orig, C, H, W = frames_t.shape
+        get_gray = lambda i: frames_t[i, 0]
+    elif frames_t.ndim == 4 and frames_t.shape[-1] in (1, 3):
+        T_orig, H, W, C = frames_t.shape
+        frames_t = frames_t.permute(0, 3, 1, 2).contiguous()
+        get_gray = lambda i: frames_t[i, 0]
     else:
-        raise ValueError(f"Unsupported frames shape: {frames.shape}")
-
-    # ---- input range (gray channel 0) ----
-    if frames.ndim == 4 and frames.shape[1] in (1, 3):  # (T,C,H,W)
-        gray_stack = frames[:, 0].astype(np.float32, copy=False)
-    else:  # (T,H,W,C)
-        gray_stack = frames[..., 0].astype(np.float32, copy=False)
-
-    in_min = float(np.nanmin(gray_stack))
-    in_max = float(np.nanmax(gray_stack))
-    do_clip = np.isfinite(in_min) and np.isfinite(in_max) and (in_max >= in_min)
-
-    # clip the reference frame too (optional but keeps everything consistent)
-    if do_clip:
-        frame0_gray = np.clip(frame0_gray, in_min, in_max).astype(
-            np.float32, copy=False
-        )
+        raise ValueError(f"Unsupported frames shape: {frames_t.shape}")
 
     B, T, G, D = tracks.shape
     if D != 2:
-        raise ValueError(f"predicted_tracks last dim must be 2, got {D}")
-    grid_size = int(math.sqrt(G))
-
+        raise ValueError(f"tracks last dim must be 2, got {D}")
     if T_orig > T:
-        raise ValueError(
-            f"frames has {T_orig} frames but predicted_tracks has only {T} timesteps"
-        )
+        raise ValueError(f"frames has {T_orig} frames but tracks has {T}")
 
-    sigma = float(smoothing) if smoothing is not None else 0.0
+    device = tracks.device
 
-    # Tracks for frame 0 (reference)
-    sparse_x = tracks[0, :, :, 0]  # (T, G)
-    sparse_y = tracks[0, :, :, 1]  # (T, G)
-    disp_sparse = tracks[0] - tracks[0, 0]  # (T, G, 2)
+    # determine input gray-channel range (like NumPy warping())
+    gray_stack = frames_t[:, 0]  # (T_orig,H,W)
+    gray_flat = gray_stack.reshape(-1)
+    finite_mask = torch.isfinite(gray_flat)
+    if finite_mask.any():
+        in_min = gray_flat[finite_mask].min()
+        in_max = gray_flat[finite_mask].max()
+        do_clip = in_max >= in_min
+    else:
+        do_clip = False
+    flows = []
+    warped = []
 
-    X, Y = np.meshgrid(np.arange(W), np.arange(H))  # (H,W)
-    dx_dense = np.zeros((T, H, W), dtype=np.float32)
-    dy_dense = np.zeros((T, H, W), dtype=np.float32)
+    # reference sparse points (frame 0)
+    pts0 = tracks[0, 0]  # (G,2)
+    disp = tracks[0] - tracks[0, 0]  # (T,G,2), disp[t] relative to frame 0
 
-    # Linear interpolation der sparse displacements auf dense grid
-    pts0 = (sparse_x[0], sparse_y[0])
+    # exactly like your NumPy: frame0 unchanged, flow0 zeros
+    frame0 = get_gray(0)
+    if do_clip:
+        frame0 = frame0.clamp(in_min, in_max)
+    warped.append(frame0)
+    flows.append(torch.zeros((H, W, 2), device=device, dtype=tracks.dtype))
 
-    for t in range(T):
-        dx_lin = griddata(
-            pts0,
-            disp_sparse[t, :, 0],
-            (X, Y),
-            method="linear",  # cubic
-            fill_value=np.nan,
-        )
-
-        dy_lin = griddata(
-            pts0,
-            disp_sparse[t, :, 1],
-            (X, Y),
-            method="linear",  # linear
-            fill_value=np.nan,
-        )
-
-        # NaNs mit nearest auffüllen (pro t!)
-        dx_nn = griddata(pts0, disp_sparse[t, :, 0], (X, Y), method="nearest")
-        dy_nn = griddata(pts0, disp_sparse[t, :, 1], (X, Y), method="nearest")
-
-        dx_dense[t] = np.where(np.isnan(dx_lin), dx_nn, dx_lin).astype(np.float32)
-        dy_dense[t] = np.where(np.isnan(dy_lin), dy_nn, dy_lin).astype(np.float32)
-
-    vp = np.stack((dx_dense, dy_dense), axis=1)  # (T,2,H,W)
-
-    grid_x0, grid_y0 = np.meshgrid(
-        np.arange(W, dtype=np.float32), np.arange(H, dtype=np.float32)
-    )
-
-    warpeds = [frame0_gray]
-    phis = [np.zeros((H, W, 2), dtype=np.float32)]
+    if callback is not None:
+        callback(0.0)
 
     for i in range(1, T_orig):
 
-        if callback is not None:
-            callback(i / T_orig)
+        # # clamp once for all frames to remove outliers (optional but keeps everything consistent)
+        # disp_i = disp[i]  # (G,2)
+        # # ---- (2) robust clamp outlier displacements (per-frame) ----
+        # mag = disp_i.norm(dim=-1)                 # (G,)
+        # thr = mag.median() * 3.0                  # tune: 2.5–4.0
+        # scale = (mag.clamp_max(thr) / (mag + 1e-6)).unsqueeze(-1)  # (G,1)
+        # disp_i = disp_i * scale                   # (G,2)
+        # # ------------------------------------------------------------
 
-        phi = vp[i]  # (2,h,w) evtl nicht exakt H,W
-        phi = _crop_or_pad_phi_to_hw(phi, H, W)  # -> (2,H,W), pad mit Randwert
-        phi[0] = gaussian_smooth(phi[0], smoothing)
-        phi[1] = gaussian_smooth(phi[1], smoothing)
+        # dense flow from sparse displacement
+        flow_2hw = idw_dense_flow(pts0, disp[i], H, W, k=k, power=power)  # (2,H,W)
 
-        phis.append(np.stack([phi[0], phi[1]], axis=-1))  # (H,W,2) (smoothed)
+        # spatial smoothing (optional)
+        flow_2hw = gaussian_blur_2hw(flow_2hw, float(smoothing) if smoothing else 0.0)
 
-        sample_x = grid_x0 + phi[0]
-        sample_y = grid_y0 + phi[1]
-
-        src = get_frame_gray(i).astype(np.float32, copy=False)
-
-        warped = map_coordinates(
-            src, [sample_y, sample_x], order=2, mode="nearest"
-        ).astype(np.float32)
+        # warp
+        out = warp_like_numpy(get_gray(i), flow_2hw, mode=mode)
 
         if do_clip:
-            warped = np.clip(warped, in_min, in_max, out=warped)
+            out = out.clamp(in_min, in_max)
 
-        warpeds.append(warped)
+        warped.append(out)
+        flows.append(flow_2hw.permute(1, 2, 0).contiguous())  # (H,W,2)
 
-    return np.asarray(warpeds, dtype=np.float32), np.asarray(phis, dtype=np.float32)
+        if callback is not None:
+            callback(float(i) / float(max(1, T_orig - 1)))
+
+    return torch.stack(warped, 0), torch.stack(flows, 0)

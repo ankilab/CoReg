@@ -3,11 +3,14 @@ import cv2
 import numpy as np
 import pyqtgraph as pg
 import torch
+from PIL import Image
+from transformers import AutoImageProcessor, AutoModelForKeypointMatching
 from PyQt6.QtCore import QElapsedTimer, QTimer, Qt
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QDialog,
     QFileDialog,
     QGridLayout,
@@ -24,12 +27,17 @@ from PyQt6.QtWidgets import (
 )
 
 from gui import (
+    AntsRegistrationDialog,
     MotionProfileWidget,
+    NormCorreDialog,
     ParameterDialog,
     PGImagePanel,
     ProcessingWorker,
+    PyFlowRegDialog,
     VideoLoadSettingsDialog,
 )
+from utils.cache_utils import RegistrationCache
+
 from utils.utils import (
     load_hdf5,
     load_tiff,
@@ -93,7 +101,12 @@ class ControllerGUI(QMainWindow):
         self.warped_video = None
         self.ants_video = None
         self.lddmm_video = None
+        self.normcorre_video = None
+        self.flowreg_video = None
         self.disp_field = None
+
+        # Initialize registration cache
+        self.registration_cache = RegistrationCache()
 
         self.grid_rows = 4
         self.grid_cols = 4
@@ -122,12 +135,37 @@ class ControllerGUI(QMainWindow):
         self.worker = None
         self.current_filter = "None"
         self.fps = 30
+        self.ants_params = {
+            "type_of_transform": "SyNOnly",
+            "aff_metric": "mattes",
+            "syn_metric": "mattes",
+            "reg_iterations": [40, 20, 0],
+        }
+        self.normcorre_params = {
+            "pw_rigid": True,
+            "max_shifts": (6, 6),
+            "strides": (96, 96),
+            "overlaps": (32, 32),
+            "upsample_factor_fft": 4,
+            "max_deviation_rigid": 3,
+        }
+        self.pyflowreg_params = {
+            "alpha": 1.5,
+            "min_level": 4,
+            "buffer_size": 100,
+            "save_w": True,
+        }
 
         self.ssim_score = None
         self.track_active = None
         self.selected_track_idx = None
         self.base_grid_tracked = None
         self.custom_grid_tracked = []
+
+        # Initialize MatchAnything model (lazy-loaded on first use)
+        self.matchanything = None
+        self.matchanything_processor = None
+        self.matchanything_device = None
 
         self.track_meta = []
         self._pending_track_meta = []
@@ -281,6 +319,7 @@ class ControllerGUI(QMainWindow):
                 "Features (Shi–Tomasi)",
                 "Activity map (motion)",
                 "Segmentation centroids",
+                "MatchAnything",
             ]
         )
         self._last_preset_index = self.preset_combo.currentIndex()
@@ -294,7 +333,7 @@ class ControllerGUI(QMainWindow):
 
         # 6. Registration Process
         self.process_btn = QPushButton("Registration")
-        self.process_btn.clicked.connect(self.visualize)
+        self.process_btn.clicked.connect(self.on_process_clicked)
         self.process_btn.setEnabled(False)
         self.process_btn.setStyleSheet(
             "font-size: 14px; font-weight: bold; padding: 5px;"
@@ -326,13 +365,20 @@ class ControllerGUI(QMainWindow):
         # These are created here but added to the ParameterDialog instead of main window
         self.num_points_spin = QSpinBox()
         self.num_points_spin.setRange(10, 5000)
-        self.num_points_spin.setValue(400)
+        self.num_points_spin.setValue(50)
         self.num_points_spin.valueChanged.connect(self.on_preset_params_changed)
 
         self.min_dist_spin = QSpinBox()
         self.min_dist_spin.setRange(1, 100)
         self.min_dist_spin.setValue(10)
         self.min_dist_spin.valueChanged.connect(self.on_preset_params_changed)
+
+        self.match_min_score_spin = QDoubleSpinBox()
+        self.match_min_score_spin.setRange(0.0, 1.0)
+        self.match_min_score_spin.setSingleStep(0.05)
+        self.match_min_score_spin.setDecimals(2)
+        self.match_min_score_spin.setValue(0.20)
+        self.match_min_score_spin.valueChanged.connect(self.on_preset_params_changed)
 
         self.grid_rows_ctrl = QSpinBox()
         self.grid_rows_ctrl.setRange(2, 100)
@@ -371,7 +417,7 @@ class ControllerGUI(QMainWindow):
 
         self.df_sigma_spin = QSpinBox()
         self.df_sigma_spin.setRange(0, 20)
-        self.df_sigma_spin.setValue(3)
+        self.df_sigma_spin.setValue(5)
         self.df_sigma_spin.valueChanged.connect(lambda *_: self.update_plot())
         self.df_sigma_spin.valueChanged.connect(
             lambda: self.recalculate_btn.setEnabled(True)
@@ -384,6 +430,7 @@ class ControllerGUI(QMainWindow):
 
         self.lbl_N = QLabel("Number of Points:")
         self.lbl_minDist = QLabel("Min Distance:")
+        self.lbl_match_min_score = QLabel("Match Min Score:")
         self.lbl_rows = QLabel("Rows:")
         self.lbl_cols = QLabel("Cols:")
         self.lbl_spacing = QLabel("Spacing (px):")
@@ -428,6 +475,8 @@ class ControllerGUI(QMainWindow):
         pd_layout.addWidget(self.num_points_spin)
         pd_layout.addWidget(self.lbl_minDist)
         pd_layout.addWidget(self.min_dist_spin)
+        pd_layout.addWidget(self.lbl_match_min_score)
+        pd_layout.addWidget(self.match_min_score_spin)
 
         second_bar.addWidget(self.sync_view_chk)
         second_bar.addWidget(self.reset_zoom_btn)
@@ -437,7 +486,6 @@ class ControllerGUI(QMainWindow):
         second_bar.addWidget(self.show_contrast_chk)
         second_bar.addWidget(QLabel("DF σ:"))
         second_bar.addWidget(self.df_sigma_spin)
-
         second_bar.addStretch(1)
         # Move close button to bottom
         pd_layout.removeWidget(self.param_dialog.close_btn)
@@ -463,14 +511,32 @@ class ControllerGUI(QMainWindow):
         # View selectors
         self.view_left_combo = QComboBox()
         self.view_left_combo.addItems(
-            ["Input", "Tracked Points", "Corrected", "Deformation Field"]
+            [
+                "Input",
+                "Tracked Points",
+                "Corrected",
+                "Deformation Field",
+                "ANTs",
+                "LDDMM",
+                "NoRMCorre",
+                "FlowReg",
+            ]
         )
         self.view_left_combo.setCurrentText("Tracked Points")
         self.view_left_combo.currentTextChanged.connect(lambda *_: self.update_plot())
 
         self.view_right_combo = QComboBox()
         self.view_right_combo.addItems(
-            ["Input", "Tracked Points", "Corrected", "Deformation Field"]
+            [
+                "Input",
+                "Tracked Points",
+                "Corrected",
+                "Deformation Field",
+                "ANTs",
+                "LDDMM",
+                "NoRMCorre",
+                "FlowReg",
+            ]
         )
         self.view_right_combo.setCurrentText("Corrected")
         self.view_right_combo.currentTextChanged.connect(lambda *_: self.update_plot())
@@ -613,6 +679,62 @@ class ControllerGUI(QMainWindow):
             return None, None
         return float(np.min(x[finite])), float(np.max(x[finite]))
 
+    def on_process_clicked(self):
+        """Run registration with method inferred from panel dropdown selections."""
+        method = "CoTracker"
+
+        choices = []
+        if hasattr(self, "view_left_combo") and self.view_left_combo is not None:
+            choices.append(self.view_left_combo.currentText())
+        if hasattr(self, "view_right_combo") and self.view_right_combo is not None:
+            choices.append(self.view_right_combo.currentText())
+
+        method_map = {
+            "LDDMM": "LDDMM",
+            "ANTs": "ANTs",
+            "NoRMCorre": "NoRMCorre",
+            "FlowReg": "FlowReg",
+        }
+        for c in choices:
+            mapped = method_map.get(c)
+            if mapped is not None:
+                method = mapped
+                break
+
+        ants_params = None
+        if method == "ANTs":
+            dlg = AntsRegistrationDialog(parent=self, current=self.ants_params)
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                self.status_label.setText("ANTs registration cancelled.")
+                return
+            self.ants_params = dlg.result_params()
+            ants_params = self.ants_params
+
+        normcorre_params = None
+        if method == "NoRMCorre":
+            dlg = NormCorreDialog(parent=self, current=self.normcorre_params)
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                self.status_label.setText("NoRMCorre registration cancelled.")
+                return
+            self.normcorre_params = dlg.result_params()
+            normcorre_params = self.normcorre_params
+
+        pyflowreg_params = None
+        if method == "FlowReg":
+            dlg = PyFlowRegDialog(parent=self, current=self.pyflowreg_params)
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                self.status_label.setText("PyFlowReg registration cancelled.")
+                return
+            self.pyflowreg_params = dlg.result_params()
+            pyflowreg_params = self.pyflowreg_params
+
+        self.visualize(
+            method=method,
+            ants_params=ants_params,
+            normcorre_params=normcorre_params,
+            pyflowreg_params=pyflowreg_params,
+        )
+
     def on_sync_view_toggled(self, state):
         master_vb = self.view_left.vb
         vb_r = self.view_right.vb
@@ -662,10 +784,14 @@ class ControllerGUI(QMainWindow):
         is_features = preset.startswith("Features")
         is_activity = preset.startswith("Activity")
         is_seg = preset.startswith("Segmentation")
+        is_matchanything = preset.startswith("MatchAnything")
 
         show_rows_cols = is_grid and not is_none
-        show_n = (is_features or is_activity or is_seg) and not is_none
-        show_mindist = (is_features or is_activity) and not is_none
+        show_n = (
+            is_features or is_activity or is_seg or is_matchanything
+        ) and not is_none
+        show_mindist = (is_features or is_activity or is_matchanything) and not is_none
+        show_match_score = is_matchanything and not is_none
         show_spacing = is_grid and not is_none
 
         self._set_visible(
@@ -674,6 +800,9 @@ class ControllerGUI(QMainWindow):
         )
         self._set_visible([self.lbl_N, self.num_points_spin], show_n)
         self._set_visible([self.lbl_minDist, self.min_dist_spin], show_mindist)
+        self._set_visible(
+            [self.lbl_match_min_score, self.match_min_score_spin], show_match_score
+        )
         # Spacing control should only be enabled for Regular grid
         if hasattr(self, "lbl_spacing") and hasattr(self, "grid_spacing_spin"):
             self._set_visible([self.lbl_spacing, self.grid_spacing_spin], show_spacing)
@@ -881,7 +1010,7 @@ class ControllerGUI(QMainWindow):
         )
         return pts[good]
 
-    def _preset_features(self, ref_u8_filt, num_points=400, min_dist=10):
+    def _preset_features(self, ref_u8_filt, num_points=50, min_dist=10):
         """Generate tracking points based on Shi-Tomasi feature detection."""
         H, W = ref_u8_filt.shape[:2]
         _, m = cv2.threshold(ref_u8_filt, 0, 255, cv2.THRESH_OTSU)
@@ -952,6 +1081,154 @@ class ControllerGUI(QMainWindow):
         cent = cent[order][: int(num_points)]
         cent = self._clip_border(cent, H, W, border=0)
         return cent
+
+    def _preset_matchanything(
+        self,
+        frame_u8,
+        ref_u8,
+        num_points=200,
+        min_score=0.2,
+        min_dist=10,
+    ):
+        """
+        Generate preset points from MatchAnything correspondences.
+
+        Returns points in the reference frame so it matches the behavior of the
+        other preset methods, which return (N, 2) point coordinates.
+        """
+
+        def _to_pil_rgb(img):
+            arr = np.asarray(img)
+
+            if arr.ndim == 2:
+                arr = arr.astype(np.float32)
+                mn, mx = float(np.nanmin(arr)), float(np.nanmax(arr))
+                if mx > mn:
+                    arr = (arr - mn) / (mx - mn) * 255.0
+                arr = np.clip(arr, 0, 255).astype(np.uint8)
+                arr = np.repeat(arr[..., None], 3, axis=-1)
+                return Image.fromarray(arr)
+
+            if arr.ndim == 3 and arr.shape[-1] == 1:
+                arr = arr[..., 0].astype(np.float32)
+                mn, mx = float(np.nanmin(arr)), float(np.nanmax(arr))
+                if mx > mn:
+                    arr = (arr - mn) / (mx - mn) * 255.0
+                arr = np.clip(arr, 0, 255).astype(np.uint8)
+                arr = np.repeat(arr[..., None], 3, axis=-1)
+                return Image.fromarray(arr)
+
+            if arr.ndim == 3 and arr.shape[-1] == 3:
+                arr = arr.astype(np.float32)
+                mn, mx = float(np.nanmin(arr)), float(np.nanmax(arr))
+                if mx > mn:
+                    arr = (arr - mn) / (mx - mn) * 255.0
+                arr = np.clip(arr, 0, 255).astype(np.uint8)
+                return Image.fromarray(arr)
+
+            raise ValueError(f"Unsupported image shape: {arr.shape}")
+
+        # Lazy-load MatchAnything on first use
+        if self.matchanything is None:
+            try:
+                model_name = "zju-community/matchanything_eloftr"
+                device = getattr(
+                    self,
+                    "device",
+                    "cuda" if torch.cuda.is_available() else "cpu",
+                )
+
+                self.matchanything_device = device
+                self.matchanything_processor = AutoImageProcessor.from_pretrained(
+                    model_name
+                )
+                self.matchanything = AutoModelForKeypointMatching.from_pretrained(
+                    model_name
+                )
+                self.matchanything.eval().to(device)
+
+            except Exception as e:
+                self.status_label.setText(
+                    f"MatchAnything model not available: {e}. Using fallback points."
+                )
+                return matchanything_wrapper.suggest_points(
+                    ref_u8,
+                    num_points=num_points,
+                    min_dist=min_dist,
+                )
+
+        H, W = ref_u8.shape[:2]
+
+        try:
+            img0 = _to_pil_rgb(frame_u8)  # current frame
+            img1 = _to_pil_rgb(ref_u8)  # reference frame
+
+            inputs = self.matchanything_processor([img0, img1], return_tensors="pt")
+            inputs = {k: v.to(self.matchanything_device) for k, v in inputs.items()}
+
+            with torch.inference_mode():
+                if str(self.matchanything_device).startswith("cuda"):
+                    with torch.autocast(device_type="cuda", dtype=torch.float16):
+                        outputs = self.matchanything(**inputs)
+                else:
+                    outputs = self.matchanything(**inputs)
+
+            result = self.matchanything_processor.post_process_keypoint_matching(
+                outputs,
+                [[(img0.height, img0.width), (img1.height, img1.width)]],
+                threshold=float(min_score),
+            )[0]
+
+            points0 = result["keypoints0"].detach().cpu().numpy().astype(np.float32)
+            points1 = result["keypoints1"].detach().cpu().numpy().astype(np.float32)
+            scores = result["matching_scores"].detach().cpu().numpy().astype(np.float32)
+
+        except Exception as e:
+            self.status_label.setText(
+                f"MatchAnything inference failed: {e}. Using fallback points."
+            )
+            return matchanything_wrapper.suggest_points(
+                ref_u8,
+                num_points=num_points,
+                min_dist=min_dist,
+            )
+
+        if points1 is None or len(points1) == 0:
+            return np.zeros((0, 2), dtype=np.float32)
+
+        keep = scores >= float(min_score)
+        points1 = points1[keep]
+        scores = scores[keep]
+
+        if len(points1) == 0:
+            return np.zeros((0, 2), dtype=np.float32)
+
+        order = np.argsort(-scores)
+        points1 = points1[order]
+
+        # Keep a spatially diverse subset using minimum inter-point distance.
+        min_dist_px = float(max(0.0, min_dist))
+        if min_dist_px > 0:
+            selected = []
+            thr2 = min_dist_px * min_dist_px
+            for p in points1:
+                if not selected:
+                    selected.append(p)
+                else:
+                    q = np.asarray(selected, dtype=np.float32)
+                    d2 = np.sum((q - p) ** 2, axis=1)
+                    if float(np.min(d2)) >= thr2:
+                        selected.append(p)
+                if len(selected) >= int(num_points):
+                    break
+            if not selected:
+                return np.zeros((0, 2), dtype=np.float32)
+            points1 = np.asarray(selected, dtype=np.float32)
+        else:
+            points1 = points1[: int(num_points)]
+
+        points1 = self._clip_border(points1, H, W, border=0)
+        return points1.astype(np.float32)
 
     def _preset_regular_grid(
         self, H, W, rows, cols, spacing_px=0, offset_x=0, offset_y=0
@@ -1157,6 +1434,19 @@ class ControllerGUI(QMainWindow):
                 pts_new = self._preset_activity(
                     gray, num_points=num_points, min_dist=min_dist
                 )
+            elif preset.startswith("MatchAnything"):
+                min_score = (
+                    float(self.match_min_score_spin.value())
+                    if hasattr(self, "match_min_score_spin")
+                    else 0.2
+                )
+                pts_new = self._preset_matchanything(
+                    ref_u8_filt,
+                    ref_u8,
+                    num_points=num_points,
+                    min_score=min_score,
+                    min_dist=min_dist,
+                )
             else:
                 pts_new = self._preset_segmentation_centroids(
                     ref_u8_filt, num_points=num_points
@@ -1237,6 +1527,8 @@ class ControllerGUI(QMainWindow):
             self.video_data = None
             self.total_frames = 0
             self.current_frame = 0
+            # Clear cache when video changes
+            self.registration_cache.clear()
 
         # Reset processing results
         self.pred_tracks = None
@@ -1246,6 +1538,8 @@ class ControllerGUI(QMainWindow):
         self.disp_field = None
         self.ants_video = None
         self.lddmm_video = None
+        self.normcorre_video = None
+        self.flowreg_video = None
 
         # Reset panel displays
         if hasattr(self, "view_left"):
@@ -1291,6 +1585,8 @@ class ControllerGUI(QMainWindow):
         self.disp_field = None
         self.ants_video = None
         self.lddmm_video = None
+        self.normcorre_video = None
+        self.flowreg_video = None
         self.ssim_score = None
 
         # Per-track UI state
@@ -1391,6 +1687,8 @@ class ControllerGUI(QMainWindow):
         self.disp_field = None
         self.ants_video = None
         self.lddmm_video = None
+        self.normcorre_video = None
+        self.flowreg_video = None
         self.ssim_score = None
         if isinstance(self.viz_data, dict):
             self.viz_data.pop("warped", None)
@@ -1511,6 +1809,9 @@ class ControllerGUI(QMainWindow):
 
             self.video_data = video_t
 
+            # Update cache with new input video
+            self.registration_cache.set_input(self.video_data)
+
             # -----------------------------
             # 3) Continue with existing UI logic
             # -----------------------------
@@ -1550,6 +1851,7 @@ class ControllerGUI(QMainWindow):
         except Exception as e:
             self.status_label.setText(f"Error loading data: {e}")
             self.video_data = None
+            self.registration_cache.clear()
             return
 
         # -----------------------------
@@ -1646,6 +1948,8 @@ class ControllerGUI(QMainWindow):
         Finds the index of the point in 'pts' closest to (x, y).
         Returns: (index, euclidean_distance)
         """
+        if pts is None or len(pts) == 0:
+            return None, float("inf")
         d2 = (pts[:, 0] - x) ** 2 + (pts[:, 1] - y) ** 2
         idx = int(np.argmin(d2))
         return idx, float(np.sqrt(d2[idx]))
@@ -1806,7 +2110,7 @@ class ControllerGUI(QMainWindow):
                 tracks = self._squeeze_batch_dim(self.pred_tracks)
                 current_pts = tracks[self.current_frame]
                 t_idx, t_dist = self._nearest_point(current_pts, x_f, y_f)
-                if t_dist < tol:
+                if t_idx is not None and t_dist < tol:
                     self._tracks_user_edited = True
                     self.selected_track_idx = t_idx
                     if (
@@ -1833,7 +2137,7 @@ class ControllerGUI(QMainWindow):
                 tracks = self._squeeze_batch_dim(self.pred_tracks)
                 current_pts = tracks[self.current_frame]
                 tidx, tdist = self._nearest_point(current_pts, x_f, y_f)
-                if tdist < 15.0:
+                if tidx is not None and tdist < 15.0:
                     self._drag = ("track", tidx)
                     return
 
@@ -2189,7 +2493,7 @@ class ControllerGUI(QMainWindow):
             return
 
         # ---------- Corrected (ANTs) ----------
-        if which == "Corrected (ANTs)":
+        if which == "ANTs":
             if self.ants_video is not None:
                 panel.set_image(
                     self.ants_video[idx],
@@ -2202,7 +2506,7 @@ class ControllerGUI(QMainWindow):
             return
 
         # ---------- Corrected (LDDMM) ----------
-        if which == "Corrected (LDDMM)":
+        if which == "LDDMM":
             if self.lddmm_video is not None:
                 panel.set_image(
                     self.lddmm_video[idx],
@@ -2214,12 +2518,46 @@ class ControllerGUI(QMainWindow):
             clear_overlays()
             return
 
+        # ---------- Corrected (NoRMCorre) ----------
+        if which == "NoRMCorre":
+            normcorre_video = getattr(self, "normcorre_video", None)
+            if normcorre_video is not None:
+                panel.set_image(
+                    normcorre_video[idx],
+                    auto_range=False,
+                    levels=self._calc_levels(normcorre_video[idx]),
+                )
+            else:
+                panel.set_image(None)
+            clear_overlays()
+            return
+
+        # ---------- Corrected (FlowReg) ----------
+        if which == "FlowReg":
+            flowreg_video = getattr(self, "flowreg_video", None)
+            if flowreg_video is not None:
+                panel.set_image(
+                    flowreg_video[idx],
+                    auto_range=False,
+                    levels=self._calc_levels(flowreg_video[idx]),
+                )
+            else:
+                panel.set_image(None)
+            clear_overlays()
+            return
+
         # fallback
         panel.set_image(original_frame, auto_range=False, levels=levels_orig)
         panel.fit_view_to_image_and_points(None, margin=20)
         clear_overlays()
 
-    def visualize(self, method="CoTracker"):
+    def visualize(
+        self,
+        method="CoTracker",
+        ants_params=None,
+        normcorre_params=None,
+        pyflowreg_params=None,
+    ):
         """
         Initiate the motion correction processing via the specified method.
         """
@@ -2254,6 +2592,25 @@ class ControllerGUI(QMainWindow):
         # Lock UI to prevent user interference during complex processing
         self.status_label.setText("Processing... (This may take a while)")
         self._set_ui_processing_state(True)
+
+        # Check cache for direct registration methods (ANTs, LDDMM, NoRMCorre, FlowReg)
+        if method in ["ANTs", "LDDMM", "NoRMCorre", "FlowReg"]:
+            # Collect parameters for this method
+            method_params = {}
+            if method == "ANTs":
+                method_params = ants_params or {}
+            elif method == "NoRMCorre":
+                method_params = normcorre_params or {}
+            elif method == "FlowReg":
+                method_params = pyflowreg_params or {}
+
+            # Check if we have cached results
+            cached_result = self.registration_cache.get(method, method_params)
+            if cached_result is not None:
+                warped_np, disp_arr = cached_result
+                self.status_label.setText(f"Using cached {method} results")
+                self.on_processing_finished(None, None, None, None, warped_np, disp_arr)
+                return
 
         video_in = self._get_video_input_for_tracking()
         video_out = self.video_data
@@ -2362,7 +2719,7 @@ class ControllerGUI(QMainWindow):
         if (
             new_queries is None
             and existing_data is None
-            and method not in ["ANTs", "LDDMM"]
+            and method not in ["ANTs", "LDDMM", "NoRMCorre", "FlowReg"]
         ):
             self.status_label.setText("No points to track.")
             self.process_btn.setEnabled(True)
@@ -2372,7 +2729,7 @@ class ControllerGUI(QMainWindow):
 
         # Prepare processing worker
         sigma = (
-            float(self.df_sigma_spin.value()) if hasattr(self, "df_sigma_spin") else 3.0
+            float(self.df_sigma_spin.value()) if hasattr(self, "df_sigma_spin") else 5.0
         )
 
         self.worker = ProcessingWorker(
@@ -2383,6 +2740,9 @@ class ControllerGUI(QMainWindow):
             method=method,
             queries=new_queries,
             df_sigma=sigma,
+            ants_params=ants_params,
+            normcorre_params=normcorre_params,
+            pyflowreg_params=pyflowreg_params,
         )
 
         # your worker expects new_queries in custom_grid_pts sometimes:
@@ -2450,7 +2810,7 @@ class ControllerGUI(QMainWindow):
         self._cleanup_worker()
 
         sigma = (
-            float(self.df_sigma_spin.value()) if hasattr(self, "df_sigma_spin") else 3.0
+            float(self.df_sigma_spin.value()) if hasattr(self, "df_sigma_spin") else 5.0
         )
 
         self.worker = ProcessingWorker(
@@ -2672,12 +3032,37 @@ class ControllerGUI(QMainWindow):
         """
         self._auto_fit_done = False
 
-        # 1) Handle Non-Tracking Methods (ANTs / LDDMM)
+        # 1) Handle Non-Tracking Methods (ANTs / LDDMM / NoRMCorre / FlowReg)
         if pred_tracks is None and warped_video is not None:
-            method = getattr(self.worker, "method", "ANTs")
+            method = getattr(self.worker, "method", "ANTs") if self.worker else "ANTs"
+
+            # Collect method parameters for caching
+            method_params = {}
+            if method == "ANTs":
+                method_params = self.ants_params
+            elif method == "NoRMCorre":
+                method_params = self.normcorre_params
+            elif method == "FlowReg":
+                method_params = self.pyflowreg_params
+
+            # Cache the result
+            warped_np = np.asarray(warped_video, dtype=np.float32)
+            disp_np = (
+                np.asarray(disp_field, dtype=np.float32)
+                if disp_field is not None
+                else np.zeros_like(warped_np)[..., :2]
+            )
+            self.registration_cache.put(method, warped_np, disp_np, method_params)
+
             if method == "LDDMM":
                 self.lddmm_video = self._to_thwc(warped_video)
                 self.status_label.setText("LDDMM registration finished")
+            elif method == "NoRMCorre":
+                self.normcorre_video = self._to_thwc(warped_video)
+                self.status_label.setText("NoRMCorre registration finished")
+            elif method == "FlowReg":
+                self.flowreg_video = self._to_thwc(warped_video)
+                self.status_label.setText("FlowReg registration finished")
             else:
                 self.ants_video = self._to_thwc(warped_video)
                 self.status_label.setText("ANTs registration finished")
@@ -3053,74 +3438,131 @@ class ControllerGUI(QMainWindow):
 
     # -----Save Logic-----
     def save_results(self):
-        """Save the warped video and tracking data to an HDF5 file."""
-        if self.warped_video is None:
+        """Save selected corrected outputs to separate HDF5 files."""
+        available = {
+            "Corrected": self.warped_video,
+            "ANTs": self.ants_video,
+            "LDDMM": self.lddmm_video,
+            "NoRMCorre": self.normcorre_video,
+            "FlowReg": self.flowreg_video,
+        }
+        available = {k: v for k, v in available.items() if v is not None}
+
+        if not available:
+            self.status_label.setText("No corrected outputs available to save.")
             return
 
-        suggested_path = "output_warped.h5"
+        # Selection dialog: choose which corrected outputs to save.
+        sel_dlg = QDialog(self)
+        sel_dlg.setWindowTitle("Select Corrected Outputs")
+        sel_layout = QVBoxLayout(sel_dlg)
+        sel_layout.addWidget(
+            QLabel("Choose corrected outputs to save as separate files:")
+        )
+
+        checks = {}
+        for name in available.keys():
+            chk = QCheckBox(name)
+            chk.setChecked(True)
+            sel_layout.addWidget(chk)
+            checks[name] = chk
+
+        btn_row = QHBoxLayout()
+        ok_btn = QPushButton("Save")
+        cancel_btn = QPushButton("Cancel")
+        ok_btn.clicked.connect(sel_dlg.accept)
+        cancel_btn.clicked.connect(sel_dlg.reject)
+        btn_row.addWidget(ok_btn)
+        btn_row.addWidget(cancel_btn)
+        sel_layout.addLayout(btn_row)
+
+        if sel_dlg.exec() != QDialog.DialogCode.Accepted:
+            self.status_label.setText("Save canceled.")
+            return
+
+        selected = [name for name, chk in checks.items() if chk.isChecked()]
+        if not selected:
+            self.status_label.setText("No outputs selected for saving.")
+            return
+
+        suggested_path = "output_corrected.h5"
         if getattr(self, "video_path", None):
             dir_in = os.path.dirname(self.video_path)
             base_in = os.path.splitext(os.path.basename(self.video_path))[0]
-            suggested_path = os.path.join(dir_in, f"{base_in}_warped.h5")
+            suggested_path = os.path.join(dir_in, f"{base_in}_corrected.h5")
 
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Save Warped Video (HDF5)", suggested_path, "HDF5 File (*.h5 *.hdf5)"
+        base_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Choose Base Output Path",
+            suggested_path,
+            "HDF5 File (*.h5 *.hdf5)",
         )
-        if not path:
+        if not base_path:
+            self.status_label.setText("Save canceled.")
             return
 
-        root_p, ext_p = os.path.splitext(path)
+        root_p, ext_p = os.path.splitext(base_path)
         if ext_p.lower() not in [".h5", ".hdf5"]:
-            path = root_p + ".h5"
+            ext_p = ".h5"
 
         try:
             import h5py
 
-            vid_arr = np.asarray(self.warped_video)
             tracks_arr = None
             if getattr(self, "viz_data", None):
                 tracks_arr = self.viz_data.get("tracks", None)
-
             if tracks_arr is not None:
                 tracks_arr = np.asarray(tracks_arr)
                 if tracks_arr.ndim != 3 or tracks_arr.shape[-1] != 2:
-                    raise ValueError(
-                        f"Invalid tracks shape {tracks_arr.shape}; "
-                        "expected (T, N, 2)."
-                    )
+                    tracks_arr = None
 
-                # Transpose if necessary (Match T dimension)
-                if (
-                    tracks_arr.shape[0] != vid_arr.shape[0]
-                    and tracks_arr.shape[1] == vid_arr.shape[0]
-                ):
-                    tracks_arr = np.transpose(tracks_arr, (1, 0, 2))
+            saved_paths = []
+            for name in selected:
+                data_arr = np.asarray(available[name])
 
-            with h5py.File(path, "w") as h5_file:
-                h5_file.create_dataset(
-                    "data",
-                    data=vid_arr,
-                    compression="gzip",
-                    compression_opts=4,
-                    chunks=True,
-                )
+                if len(selected) == 1:
+                    out_path = root_p + ext_p
+                else:
+                    suffix = name.replace(" ", "_")
+                    out_path = f"{root_p}_{suffix}{ext_p}"
 
-                h5_file.attrs["fps"] = float(getattr(self, "fps", 30))
-                if getattr(self, "video_path", None):
-                    h5_file.attrs["source_video_path"] = str(self.video_path)
-
-                if tracks_arr is not None:
+                with h5py.File(out_path, "w") as h5_file:
                     h5_file.create_dataset(
-                        "tracks",
-                        data=tracks_arr,
+                        "data",
+                        data=data_arr,
                         compression="gzip",
                         compression_opts=4,
                         chunks=True,
                     )
-                    h5_file.attrs["tracks_format"] = "T,N,2"
-                    h5_file.attrs["tracks_xy"] = "pixel"
+                    h5_file.attrs["method"] = name
+                    h5_file.attrs["fps"] = float(getattr(self, "fps", 30))
+                    if getattr(self, "video_path", None):
+                        h5_file.attrs["source_video_path"] = str(self.video_path)
 
-            self.status_label.setText(f"Saved results to {path}")
+                    if tracks_arr is not None:
+                        tr = tracks_arr
+                        if (
+                            tr.shape[0] != data_arr.shape[0]
+                            and tr.shape[1] == data_arr.shape[0]
+                        ):
+                            tr = np.transpose(tr, (1, 0, 2))
+                        if tr.shape[0] == data_arr.shape[0]:
+                            h5_file.create_dataset(
+                                "tracks",
+                                data=tr,
+                                compression="gzip",
+                                compression_opts=4,
+                                chunks=True,
+                            )
+                            h5_file.attrs["tracks_format"] = "T,N,2"
+                            h5_file.attrs["tracks_xy"] = "pixel"
+
+                saved_paths.append(out_path)
+
+            if len(saved_paths) == 1:
+                self.status_label.setText(f"Saved results to {saved_paths[0]}")
+            else:
+                self.status_label.setText(f"Saved {len(saved_paths)} corrected files.")
 
         except Exception as err:
             self.status_label.setText(f"Save error: {err}")
