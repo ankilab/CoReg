@@ -158,7 +158,16 @@ class ProcessingWorker(QThread):
                     self.progress.emit(int(i / max(1, t) * 100))
 
                     if i == 0:
-                        results.append(vd_out[0])
+                        # For the reference frame, append a 2D grayscale frame
+                        base_frame = vd_out[0]
+                        if base_frame.ndim == 3:
+                            if base_frame.shape[-1] == 3:
+                                base_frame = cv2.cvtColor(
+                                    base_frame, cv2.COLOR_RGB2GRAY
+                                )
+                            else:
+                                base_frame = base_frame[:, :, 0]
+                        results.append(base_frame)
                         continue
 
                     moving_frame = vd_reg[i]
@@ -197,11 +206,13 @@ class ProcessingWorker(QThread):
 
                     reg = ants.registration(**reg_kwargs)
 
-                    # Apply transform to vd_out[i]
+                    # Apply transform to vd_out[i]; always warp a 2D grayscale image
                     to_warp = vd_out[i]
-                    if to_warp.ndim == 3 and to_warp.shape[-1] == 1:
-                        # ANTs requires 2D input for 2D images
-                        to_warp = to_warp[:, :, 0]
+                    if to_warp.ndim == 3:
+                        if to_warp.shape[-1] == 3:
+                            to_warp = cv2.cvtColor(to_warp, cv2.COLOR_RGB2GRAY)
+                        else:
+                            to_warp = to_warp[:, :, 0]
 
                     warped_image = ants.apply_transforms(
                         fixed=fixed_image,
@@ -209,9 +220,6 @@ class ProcessingWorker(QThread):
                         transformlist=reg["fwdtransforms"],
                     )
                     warped = warped_image.numpy()
-
-                    if vd_out[i].ndim == 3 and vd_out[i].shape[-1] == 1:
-                        warped = warped[..., None]
 
                     results.append(warped)
 
@@ -247,6 +255,8 @@ class ProcessingWorker(QThread):
                 T = vd_reg.shape[0]
                 results = []
 
+                # Use grayscale for LDDMM registration and outputs so that
+                # all stacked frames share the same (H, W) shape.
                 ref_frame = vd_reg[0]
                 if ref_frame.ndim == 3:
                     if ref_frame.shape[-1] == 3:
@@ -254,13 +264,21 @@ class ProcessingWorker(QThread):
                     else:
                         ref_frame = ref_frame[:, :, 0]
 
+                first_out = vd_out[0]
+                if first_out.ndim == 3:
+                    if first_out.shape[-1] == 3:
+                        first_out = cv2.cvtColor(first_out, cv2.COLOR_RGB2GRAY)
+                    else:
+                        first_out = first_out[:, :, 0]
+                first_out = np.asarray(first_out, dtype=np.float32)
+
                 for i in range(T):
                     if not self._is_running:
                         return
                     self.progress.emit(int(i / max(1, T) * 100))
 
                     if i == 0:
-                        results.append(vd_out[0])
+                        results.append(first_out)
                         continue
 
                     moving_frame = vd_reg[i]
@@ -291,9 +309,14 @@ class ProcessingWorker(QThread):
 
                     # Use the class API: outputDeformedTemplate returns the warped template.
                     warped = lddmm.outputDeformedTemplate()[0]
+                    warped = np.asarray(warped, dtype=np.float32)
 
-                    if vd_out[i].ndim == 3 and vd_out[i].shape[-1] == 1:
-                        warped = warped[..., None]
+                    # Ensure 2D grayscale (H, W)
+                    if warped.ndim == 3:
+                        if warped.shape[-1] == 3:
+                            warped = cv2.cvtColor(warped, cv2.COLOR_RGB2GRAY)
+                        else:
+                            warped = warped[:, :, 0]
 
                     results.append(warped)
 

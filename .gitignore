@@ -221,3 +221,8 @@ __marimo__/
 
 __pycache__/
 .vscode/
+
+
+# Files
+compare_baselines.py
+out/*

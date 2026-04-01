@@ -17,17 +17,22 @@
 ##  Repository Structure
 
 ```text
-├── src/CoReg/                  # Main application package
-│   ├── gui.py                  # GUI entry point and UI layout
-│   ├── controller.py           # Core logic and process management
-│   ├── cotracker/              # CoTracker model architecture
-│   └── utils/                  # Registration algorithms and utilities
-│       ├── ants_register.py    # ANTs-based registration
-│       ├── lddmm_register.py   # LDDMM implementation
-│       ├── mc_cotracker.py     # CoTracker motion correction
-│       └── utils.py            # Data loading and image processing
-├── requirements.txt            # Project dependencies
-└── pyproject.toml              # Build and installation configuration
+├── src/CoReg/                      # Main application package
+│   ├── gui.py                      # GUI entry point and UI layout
+│   ├── controller.py               # Core logic and process management
+│   ├── cotracker/                  # CoTracker model architecture
+│   └── utils/                      # Registration algorithms and utilities
+│       ├── ants_wrapper.py         # ANTs-based registration
+│       ├── lddmm_register.py       # LDDMM implementation
+│       ├── lddmm_wrapper.py        # Implementation to call LDDMM
+│       ├── mc_cotracker.py         # CoTracker motion correction
+│       ├── utils.py                # Data loading and image processing
+│       ├── cache_utils.py          # to compare resultsy    
+│       ├── normcorre_wrapper.py    # Wrapper to call jnormcorre implementation for the registration
+│       ├── pyflowreg_wrapper.py    # Wrapper to call pyflowreg implementation for the registration
+│       └── utils.py                # Helper files
+├── requirements.txt                # Project dependencies
+└── pyproject.toml                  # Build and installation configuration
 ```
 
 
@@ -77,6 +82,15 @@ python -m gui
 3.  **Process**: Click "Registration" to start the motion correction process.
 4.  **Preview & Save**: Review the warped results and export them to your desired format.
 
+---
+
+### Testing Baselines
+If you want to test baselines you have to just one baseline selected in the currect window and then click "Regsitration". For all baseline a context menu shows up to adjust the parameter for the registration.
+You can test:
+* ANTs
+* LDDMM
+* NoRMCorre
+* FlowReg
 ---
 
 ## 📂 Supported Formats

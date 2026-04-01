@@ -47,116 +47,6 @@ def _to_gray_thw(video_thwc: np.ndarray) -> np.ndarray:
     raise ValueError(f"Unsupported channel count: {video_thwc.shape[-1]}")
 
 
-def _broadcast_rigid_shifts_to_dense(
-    shifts: np.ndarray,
-    height: int,
-    width: int,
-) -> np.ndarray:
-    """
-    Convert rigid shifts (T, 2) into dense displacement field (T, H, W, 2).
-    """
-    shifts = np.asarray(shifts, dtype=np.float32)
-    if shifts.ndim != 2 or shifts.shape[1] != 2:
-        raise ValueError(f"Expected rigid shifts of shape (T, 2), got {shifts.shape}")
-
-    t = shifts.shape[0]
-    disp = np.zeros((t, height, width, 2), dtype=np.float32)
-    disp[..., 0] = shifts[:, None, None, 0]
-    disp[..., 1] = shifts[:, None, None, 1]
-    return disp
-
-
-def _compute_patch_grid(
-    height: int,
-    width: int,
-    strides: tuple[int, int],
-    overlaps: tuple[int, int],
-) -> list[tuple[int, int, int, int]]:
-    """
-    Reconstruct the pw-rigid patch grid as rectangles (r0, r1, c0, c1).
-
-    Patch size is stride + overlap, and the final patch in each dimension is
-    forced to end at the image boundary.
-    """
-    sy, sx = int(strides[0]), int(strides[1])
-    oy, ox = int(overlaps[0]), int(overlaps[1])
-
-    py = sy + oy
-    px = sx + ox
-
-    if py <= 0 or px <= 0:
-        raise ValueError(
-            f"Invalid patch size from strides={strides}, overlaps={overlaps}"
-        )
-
-    def _starts(size: int, stride: int, patch: int) -> list[int]:
-        if size <= patch:
-            return [0]
-
-        starts = list(range(0, size - patch + 1, stride))
-        last = size - patch
-        if starts[-1] != last:
-            starts.append(last)
-        return starts
-
-    y_starts = _starts(height, sy, py)
-    x_starts = _starts(width, sx, px)
-
-    patches: list[tuple[int, int, int, int]] = []
-    for r0 in y_starts:
-        r1 = min(r0 + py, height)
-        for c0 in x_starts:
-            c1 = min(c0 + px, width)
-            patches.append((r0, r1, c0, c1))
-
-    return patches
-
-
-def _patch_shifts_to_dense(
-    patch_shifts: np.ndarray,
-    height: int,
-    width: int,
-    strides: tuple[int, int],
-    overlaps: tuple[int, int],
-) -> np.ndarray:
-    """
-    Convert pw-rigid patch shifts (T, num_patches, 2) to an approximate
-    dense displacement field (T, H, W, 2) by averaging overlapping patches.
-    """
-    patch_shifts = np.asarray(patch_shifts, dtype=np.float32)
-    if patch_shifts.ndim != 3 or patch_shifts.shape[-1] != 2:
-        raise ValueError(
-            f"Expected pw-rigid shifts of shape (T, num_patches, 2), got {patch_shifts.shape}"
-        )
-
-    patches = _compute_patch_grid(
-        height=height,
-        width=width,
-        strides=strides,
-        overlaps=overlaps,
-    )
-
-    num_patches = len(patches)
-    if patch_shifts.shape[1] != num_patches:
-        raise RuntimeError(
-            f"Patch shift count mismatch: got {patch_shifts.shape[1]} shifts but "
-            f"expected {num_patches} patches from strides={strides}, overlaps={overlaps}, "
-            f"image size={(height, width)}"
-        )
-
-    t = patch_shifts.shape[0]
-    disp_sum = np.zeros((t, height, width, 2), dtype=np.float32)
-    disp_count = np.zeros((height, width, 1), dtype=np.float32)
-
-    for patch_idx, (r0, r1, c0, c1) in enumerate(patches):
-        disp_sum[:, r0:r1, c0:c1, 0] += patch_shifts[:, patch_idx, 0][:, None, None]
-        disp_sum[:, r0:r1, c0:c1, 1] += patch_shifts[:, patch_idx, 1][:, None, None]
-        disp_count[r0:r1, c0:c1, 0] += 1.0
-
-    disp_count = np.maximum(disp_count, 1.0)
-    return disp_sum / disp_count[None, ...]
-
-
 def register_video(
     video: np.ndarray | torch.Tensor,
     reference_index: int = 0,
@@ -170,111 +60,71 @@ def register_video(
     max_deviation_rigid: int = 3,
     add_to_movie: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Thin in-memory wrapper around jnormcorre.
-
-    Parameters
-    ----------
-    video : np.ndarray | torch.Tensor
-        Input video in THW, THWC, or TCHW format.
-    reference_index : int
-        Frame used as the registration template.
-    callback : callable | None
-        Optional progress callback receiving values in [0, 1].
-    pw_rigid : bool
-        If True, use piecewise-rigid registration; otherwise rigid only.
-    max_shifts : tuple[int, int]
-        Max allowed shifts in (row, col).
-    strides : tuple[int, int]
-        Patch strides for pw-rigid mode.
-    overlaps : tuple[int, int]
-        Patch overlaps for pw-rigid mode.
-    upsample_factor_fft : int
-        Subpixel resolution / shift upsampling factor.
-    max_deviation_rigid : int
-        Max patch deviation from rigid shift in pw-rigid mode.
-    add_to_movie : float | None
-        Constant offset added before registration. If None, chosen automatically
-        so the working movie is non-negative.
-
-    Returns
-    -------
-    warped : np.ndarray
-        Registered video as THWC float32 numpy array.
-    disp : np.ndarray
-        Dense displacement field as THW2 float32 numpy array.
-
-    Notes
-    -----
-    - This wrapper uses a single reference frame as template.
-    - For pw-rigid mode, `disp` is an approximate dense field reconstructed
-      from the returned per-patch shifts by averaging overlaps.
-    """
-
+    # 1. Standardize Input
     v = _to_thwc(video).astype(np.float32)
     t, h, w, c = v.shape
     ref_idx = int(np.clip(reference_index, 0, max(0, t - 1)))
 
-    gray = _to_gray_thw(v).astype(np.float32)  # (T, H, W)
-    template = np.asarray(gray[ref_idx], dtype=np.float32)
+    # 2. Prepare Template (Grayscale)
+    gray = _to_gray_thw(v)
+    template = gray[ref_idx]
 
     if add_to_movie is None:
         min_val = float(np.min(gray))
         add_to_movie = -min_val if min_val < 0 else 0.0
 
-    if callback is not None:
-        callback(0.05)
+    if callback:
+        callback(0.1)
 
+    # 3. Core NoRMCorre Logic
+    # Apply registration to the GRAYSCALE video to get the shifts.
+    # Match the installed jnormcorre signatures exactly to avoid JAX vmap errors.
     if pw_rigid:
-        warped_gray, patch_shifts = register_frames_to_template_pwrigid(
+        strides_0, strides_1 = int(strides[0]), int(strides[1])
+        overlaps_0, overlaps_1 = int(overlaps[0]), int(overlaps[1])
+        max_shifts_arr = np.asarray(max_shifts, dtype=gray.dtype)
+        up_fft = int(upsample_factor_fft)
+        max_dev = int(max_deviation_rigid)
+        add_val = np.asarray(add_to_movie, dtype=gray.dtype)
+
+        warped_gray, shifts = register_frames_to_template_pwrigid(
             gray,
             template,
-            int(strides[0]),
-            int(strides[1]),
-            int(overlaps[0]),
-            int(overlaps[1]),
-            np.asarray(max_shifts),
-            int(upsample_factor_fft),
-            int(max_deviation_rigid),
-            np.asarray(add_to_movie, dtype=np.float32),
+            strides_0,
+            strides_1,
+            overlaps_0,
+            overlaps_1,
+            max_shifts_arr,
+            up_fft,
+            max_dev,
+            add_val,
         )
     else:
-        warped_gray, rigid_shifts = register_frames_to_template_rigid(
+        max_shifts_arr = np.asarray(max_shifts, dtype=gray.dtype)
+        add_val = np.asarray(add_to_movie, dtype=gray.dtype)
+        warped_gray, shifts = register_frames_to_template_rigid(
             gray,
             template,
-            np.asarray(max_shifts),
-            np.asarray(add_to_movie, dtype=np.float32),
+            max_shifts_arr,
+            add_val,
         )
 
-    if callback is not None:
-        callback(0.80)
+    if callback:
+        callback(0.9)
 
+    # 4. Handle Multi-Channel
+    # jnormcorre operates on single-channel data. For multi-channel input we
+    # reuse the grayscale warp for all channels.
     warped_gray = np.asarray(warped_gray, dtype=np.float32)
     if warped_gray.shape != (t, h, w):
         raise RuntimeError(
-            f"Unexpected corrected shape: {warped_gray.shape}, expected {(t, h, w)}"
+            f"Unexpected corrected shape from NoRMCorre: {warped_gray.shape}, expected {(t, h, w)}"
         )
 
     warped = warped_gray[..., None]
     if c > 1:
         warped = np.repeat(warped, c, axis=-1)
 
-    if pw_rigid:
-        disp = _patch_shifts_to_dense(
-            patch_shifts=np.asarray(patch_shifts, dtype=np.float32),
-            height=h,
-            width=w,
-            strides=strides,
-            overlaps=overlaps,
-        )
-    else:
-        disp = _broadcast_rigid_shifts_to_dense(
-            shifts=np.asarray(rigid_shifts, dtype=np.float32),
-            height=h,
-            width=w,
-        )
-
-    if callback is not None:
+    if callback:
         callback(1.0)
-
-    return warped.astype(np.float32), disp.astype(np.float32)
+    return warped, np.asarray(shifts)
