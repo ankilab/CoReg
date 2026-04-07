@@ -75,6 +75,34 @@ python -m gui
 ```
 
 
+### Running the CLI (non‑interactive)
+
+After installation (`pip install -e .` in the repository root), you can run
+motion correction from the command line without opening the GUI:
+
+```bash
+coreg-cli INPUT_PATH [options]
+```
+
+Examples:
+
+- CoTracker-based registration with default settings:
+    ```bash
+    coreg-cli data/movie.tif
+    ```
+- Limit frames and resize before processing:
+    ```bash
+    coreg-cli data/movie.tif --max-frames 300 --width 256 --height 256
+    ```
+
+Key options:
+
+- `--method {cotracker,ants,lddmm,normcorre,flowreg}` – select the registration backend (default: `cotracker`).
+- `--max-frames N` – maximum number of frames to load.
+- `--width W --height H` – resize frames to a fixed size before registration.
+- `-o OUTPUT` – output file path; extension determines format (`.tif/.tiff`, `.h5/.hdf5`, `.mp4`, ...).
+
+
 ### Basic Workflow
 
 1.  **Load Data**: Drag and drop or browse to load your file (`.avi`, `.mp4`, `.tiff`, `.h5`).
