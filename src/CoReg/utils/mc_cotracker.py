@@ -1,7 +1,7 @@
 import gc
 import math
 import os
-
+from pathlib import Path
 import cv2
 import numpy as np
 import torch
@@ -12,15 +12,31 @@ from scipy.ndimage import map_coordinates
 _COTRACKER = None
 _COTRACKER_DEVICE = None
 
+def _default_torch_home() -> str:
+    # Respect existing TORCH_HOME if the user already set it
+    if "TORCH_HOME" in os.environ:
+        return os.environ["TORCH_HOME"]
+
+    # Otherwise use a cache dir in the user's home directory
+    return str(Path.home() / ".cache" / "torch")
 
 def _get_cotracker(device: str):
     global _COTRACKER, _COTRACKER_DEVICE
+
     if _COTRACKER is None or _COTRACKER_DEVICE != str(device):
-        os.environ["TORCH_HOME"] = "/data/users/va11moje/cache/cotracker"
-        model = torch.hub.load("facebookresearch/co-tracker", "cotracker3_offline")
+        torch_home = _default_torch_home()
+        os.environ["TORCH_HOME"] = torch_home
+        Path(torch_home).mkdir(parents=True, exist_ok=True)
+
+        model = torch.hub.load(
+            "facebookresearch/co-tracker",
+            "cotracker3_offline"
+        )
         model = model.to(device).eval()
+
         _COTRACKER = model
         _COTRACKER_DEVICE = str(device)
+
     return _COTRACKER
 
 

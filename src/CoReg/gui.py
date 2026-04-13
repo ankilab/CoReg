@@ -2,7 +2,7 @@ import sys
 import cv2
 import numpy as np
 import torch
-from PyQt6.QtWidgets import (
+from PyQt5.QtWidgets import (
     QApplication,
     QWidget,
     QPushButton,
@@ -17,8 +17,8 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QFileDialog,
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QThread, QPointF
-from PyQt6.QtGui import QPainter, QColor, QPolygonF, QPen
+from PyQt5.QtCore import Qt, pyqtSignal, QThread, QPointF
+from PyQt5.QtGui import QPainter, QColor, QPolygonF, QPen
 import pyqtgraph as pg
 
 # Local imports
@@ -35,9 +35,9 @@ except ImportError:
     ants = None
 
 try:
-    import utils.lddmm_wrapper as lddmm_wrapper
+    import utils.lddmm_register as lddmm_register
 except ImportError:
-    lddmm_wrapper = None
+    lddmm_register = None
 
 DEFAULT_DEVICE = (
     "cuda"
@@ -232,9 +232,9 @@ class ProcessingWorker(QThread):
             # ---------- LDDMM REGISTRATION ----------
             # Large Deformation Diffeomorphic Metric Mapping. Uses a local torch-based implementation.
             if self.method == "LDDMM":
-                if lddmm_wrapper is None:
+                if lddmm_register is None:
                     raise ImportError(
-                        "torch_lddmm is not available. Please ensure utils/torch_lddmm.py exists."
+                        "torch_lddmm is not available. Please ensure utils/lddmm_register.py exists."
                     )
 
                 self.status_update.emit("Running LDDMM registration...")

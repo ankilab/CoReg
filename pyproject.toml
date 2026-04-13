@@ -5,11 +5,11 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "coreg"             # this is the *pip install name* (can be whatever)
 version = "0.1.0"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 dependencies = [
     "numpy",
     "opencv-python",
-    "PyQt6",
+    #"PyQt6",
     "pyqtgraph",
     "torch",
     "torchvision",
@@ -23,6 +23,9 @@ dependencies = [
     "IPython",
     "imageio[pyav]",    
     "imageio[ffmpeg]",
+    "pyflowreg",
+    "jnormcorre",
+    "antspyx"
     ]
 
 [tool.setuptools]

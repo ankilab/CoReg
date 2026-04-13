@@ -1,142 +1,166 @@
 # CoReg
 
-[![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-
-**CoReg** is a high-performance motion-correction and image registration toolkit powered by [CoTracker](https://github.com/facebookresearch/co-tracker). It combines advanced point tracking with scattered warping to provide fast and accurate motion correction for various imaging applications.
+**CoReg** is a motion correction and image registration toolkit for fluorescence imaging data. It combines point-based tracking (CoTracker) with sparse-to-dense warping, and provides a graphical interface as well as a command-line interface for batch processing.
 
 ---
 
-## Overview
+## Repository structure
 
-- CoTracker tracking + scattered warping for fast motion correction.
-- Interactive GUI (PyQt6 + pyqtgraph) for loading videos, editing points, running registration, and previewing results.
-
----
-
-##  Repository Structure
-
-```text
-├── src/CoReg/                      # Main application package
-│   ├── gui.py                      # GUI entry point and UI layout
-│   ├── controller.py               # Core logic and process management
-│   ├── cotracker/                  # CoTracker model architecture
-│   └── utils/                      # Registration algorithms and utilities
-│       ├── ants_wrapper.py         # ANTs-based registration
-│       ├── lddmm_register.py       # LDDMM implementation
-│       ├── lddmm_wrapper.py        # Implementation to call LDDMM
-│       ├── mc_cotracker.py         # CoTracker motion correction
-│       ├── utils.py                # Data loading and image processing
-│       ├── cache_utils.py          # to compare resultsy    
-│       ├── normcorre_wrapper.py    # Wrapper to call jnormcorre implementation for the registration
-│       ├── pyflowreg_wrapper.py    # Wrapper to call pyflowreg implementation for the registration
-│       └── utils.py                # Helper files
-├── requirements.txt                # Project dependencies
-└── pyproject.toml                  # Build and installation configuration
+```
+src/CoReg/
+    gui.py                    # GUI widgets and background worker
+    controller.py             # Application logic and point management
+    cli.py                    # Command-line interface
+    utils/
+        mc_cotracker.py       # CoTracker tracking and warping
+        presets.py            # Point-generation presets (shared by GUI and CLI)
+        ants_wrapper.py       # ANTs registration
+        lddmm_register.py     # LDDMM implementation
+        lddmm_wrapper.py      # LDDMM wrapper
+        normcorre_wrapper.py  # NoRMCorre wrapper
+        pyflowreg_wrapper.py  # FlowReg wrapper
+        cache_utils.py        # Result caching and comparison
+        utils.py              # Data loading and image processing
+requirements.txt
+pyproject.toml
 ```
 
+---
 
+## Installation
 
-## 🚀 Installation
+**Requirements:** Python 3.10+, a CUDA-capable GPU (recommended).
 
-### Prerequisites
-
-- Python 3.10 or higher.
-- A virtual environment (recommended).
-
-### Setup
-
-1.  **Clone the repository**:
+1. Clone the repository:
     ```bash
     git clone https://github.com/neuluna/registration_gui.git
     cd registration_gui
     ```
 
-2.  **Install dependencies**:
-    It is highly recommended to install PyTorch with CUDA support for optimal performance.
+2. Install PyTorch with CUDA support. Use a build that matches your driver:
     ```bash
-    # Example for Windows with CUDA 12.6
-    pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+    # CUDA 12.1
+    pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+
+    # CUDA 12.4
+    pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+    ```
+    Verify GPU is detected:
+    ```bash
+    python -c "import torch; print(torch.cuda.is_available())"
     ```
 
-3.  **Install CoReg**:
+3. Install CoReg:
     ```bash
     pip install -e .
     ```
 
-Notes:
-- Check to install torch is with cuda support --> pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126.
 ---
 
-## Running the GUI
+## GUI
 
-```cmd
+```bash
 python -m gui
 ```
 
+**Workflow:**
 
-### Running the CLI (non‑interactive)
+1. Load a file (drag-and-drop or file browser). Supported formats: `.avi`, `.mp4`, `.tif`, `.tiff`, `.h5`, `.hdf5`.
+2. Select a point-generation preset and adjust parameters.
+3. Click **Registration** to run motion correction.
+4. Review the result in the preview panel and export.
 
-After installation (`pip install -e .` in the repository root), you can run
-motion correction from the command line without opening the GUI:
+**Point presets:**
+
+| Preset | Description |
+|---|---|
+| None | No seed points |
+| Regular grid | Uniform rows x cols grid |
+| Features (Shi-Tomasi) | Corner-based feature detection |
+| Activity map | Points in high-motion regions |
+| Segmentation centroids | Centroids of connected components |
+| MatchAnything | Keypoint matching via MatchAnything model |
+
+**Registration methods:** CoTracker, ANTs, LDDMM, NoRMCorre, FlowReg. Each method exposes a parameter dialog via the settings button.
+
+Tracked points and registered video can be saved as `.h5`.
+
+---
+
+## CLI
+
+After installation, `coreg-cli` is available on the path.
 
 ```bash
-coreg-cli INPUT_PATH [options]
+coreg-cli INPUT [options]
 ```
 
-Examples:
+`INPUT` is either a single file or a directory. For directories, all supported files are processed and outputs are written to `<input>/registered/` by default.
 
-- CoTracker-based registration with default settings:
-    ```bash
-    coreg-cli data/movie.tif
-    ```
-- Limit frames and resize before processing:
-    ```bash
-    coreg-cli data/movie.tif --max-frames 300 --width 256 --height 256
-    ```
+### General options
 
-Key options:
+| Option | Default | Description |
+|---|---|---|
+| `--method` | `cotracker` | Registration method: `cotracker`, `ants`, `lddmm`, `normcorre`, `flowreg` |
+| `-o / --output` | auto | Output path; extension sets format (`.tif`, `.h5`, `.mp4`, ...) |
+| `--output-dir` | `<input>/registered` | Output directory when INPUT is a folder |
+| `--width W --height H` | original | Resize frames before processing |
+| `--max-frames N` | all | Maximum frames to load |
+| `--overwrite` | off | Overwrite existing output files |
+| `--metrics-csv` | auto | Path for the metrics CSV (SSIM, MSE, ZNCC, MI) |
 
-- `--method {cotracker,ants,lddmm,normcorre,flowreg}` – select the registration backend (default: `cotracker`).
-- `--max-frames N` – maximum number of frames to load.
-- `--width W --height H` – resize frames to a fixed size before registration.
-- `-o OUTPUT` – output file path; extension determines format (`.tif/.tiff`, `.h5/.hdf5`, `.mp4`, ...).
+### Sequence sampling (folder input)
 
+| Option | Description |
+|---|---|
+| `--seq-frames N` | Split each video into sub-sequences of N frames |
+| `--seq-stride S` | Stride between sequence starts (default: non-overlapping) |
+| `--num-seqs K` | Sample K random sequences per video (requires `--seq-frames`) |
+| `--seed` | Random seed for reproducible sequence sampling |
 
-### Basic Workflow
+### CoTracker options
 
-1.  **Load Data**: Drag and drop or browse to load your file (`.avi`, `.mp4`, `.tiff`, `.h5`).
-2.  **Configure Points**: Adjust grid density or switch to manual mode to edit points on the first frame.
-3.  **Process**: Click "Registration" to start the motion correction process.
-4.  **Preview & Save**: Review the warped results and export them to your desired format.
+| Option | Default | Description |
+|---|---|---|
+| `--cotracker-presets` | `regular_grid` | Comma-separated list of point presets to run |
+| `--grid-rows` | `8` | Grid rows (used by `regular_grid` preset) |
+| `--grid-cols` | `8` | Grid columns (used by `regular_grid` preset) |
+| `--num-points` | `rows x cols` | Max seed points for non-grid presets |
+| `--df-sigma` | `5.0` | Gaussian smoothing sigma for the displacement field |
+
+**Available presets:** `regular_grid`, `features`, `activity`, `segmentation`, `matchanything`
+
+When multiple presets are given, each is run as a separate pass and results are saved with the preset name appended. The metrics CSV is named accordingly (e.g. `metrics_cotracker_features.csv`).
+
+### Examples
+
+```bash
+# Single file, default settings
+coreg-cli data/movie.tif
+
+# Shi-Tomasi features, 200 points
+coreg-cli data/movie.tif --method cotracker --cotracker-presets features --num-points 200
+
+# Activity preset, resize to 256x256
+coreg-cli data/movie.tif --cotracker-presets activity --width 256 --height 256
+
+# Run two presets in one call
+coreg-cli data/movie.tif --cotracker-presets regular_grid,features
+
+# Folder input: split into 100-frame sequences, 8x8 grid
+coreg-cli data/ --seq-frames 100 --grid-rows 8 --grid-cols 8
+
+# Folder input: sample 10 random sequences per video
+coreg-cli data/ --seq-frames 50 --num-seqs 10 --seed 42
+
+# ANTs registration
+coreg-cli data/movie.tif --method ants -o data/movie_ants.tif
+```
 
 ---
 
-### Testing Baselines
-If you want to test baselines you have to just one baseline selected in the currect window and then click "Regsitration". For all baseline a context menu shows up to adjust the parameter for the registration.
-You can test:
-* ANTs
-* LDDMM
-* NoRMCorre
-* FlowReg
----
+## Acknowledgements
 
-## 📂 Supported Formats
-
--   `.avi`, `.mp4`, `.tiff`, `.tif`, `.h5`
-
-> [!NOTE]
-> Tracked points and Video can be saved as `.h5`.
-
----
-
-## 💡 Performance Tips
-
--   **GPU Acceleration**: A CUDA-enabled GPU is strongly recommended for CoTracker.
-
----
-
-##  Acknowledgements
-
--   **CoTracker** by Meta Research: [GitHub Repository](https://github.com/facebookresearch/co-tracker)
--   This project adapts CoTracker components for efficient local motion correction workflows.
+- [CoTracker](https://github.com/facebookresearch/co-tracker) by Meta Research
+- [ANTsPy](https://github.com/ANTsX/ANTsPy)
+- [NoRMCorre](https://github.com/flatironinstitute/NoRMCorre)

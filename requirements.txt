@@ -1,6 +1,5 @@
 numpy
 opencv-python
-PyQt6
 pyqtgraph
 torch
 torchvision
@@ -21,3 +20,4 @@ tqdm
 jnormcorre
 pyflowreg
 transformers
+antspyx

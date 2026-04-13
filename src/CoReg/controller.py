@@ -14,8 +14,8 @@ try:
 except Exception:
     AutoImageProcessor = None
     AutoModelForKeypointMatching = None
-from PyQt6.QtCore import QElapsedTimer, QTimer, Qt
-from PyQt6.QtWidgets import (
+from PyQt5.QtCore import QElapsedTimer, QTimer, Qt
+from PyQt5.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
@@ -47,6 +47,7 @@ from gui import (
 )
 from utils.mc_cotracker import cotrack_model
 from utils.cache_utils import RegistrationCache
+import utils.presets as _presets
 
 from utils.utils import (
     load_hdf5,
@@ -177,12 +178,6 @@ class ControllerGUI(QMainWindow):
         self.selected_track_idx = None
         self.base_grid_tracked = None
         self.custom_grid_tracked = []
-
-        # Initialize MatchAnything model (lazy-loaded on first use)
-        self.matchanything = None
-        self.matchanything_processor = None
-        self.matchanything_device = None
-        self.matchanything_available = True
 
         self.track_meta = []
         self._pending_track_meta = []
@@ -1063,345 +1058,32 @@ class ControllerGUI(QMainWindow):
         return ref_u8
 
     def _clip_border(self, pts, H, W, border=0):
-        """Remove points that fall within the specified border distance of edges."""
-        if pts is None or len(pts) == 0:
-            return np.zeros((0, 2), dtype=np.float32)
-        pts = np.asarray(pts, dtype=np.float32)
-        good = (
-            (pts[:, 0] >= border)
-            & (pts[:, 0] < (W - border))
-            & (pts[:, 1] >= border)
-            & (pts[:, 1] < (H - border))
-        )
-        return pts[good]
+        return _presets.clip_border(pts, H, W, border=border)
 
     def _preset_features(self, ref_u8_filt, num_points=50, min_dist=10):
-        """Generate tracking points based on Shi-Tomasi feature detection."""
-        H, W = ref_u8_filt.shape[:2]
-        _, m = cv2.threshold(ref_u8_filt, 0, 255, cv2.THRESH_OTSU)
-        m = cv2.medianBlur(m, 5)
-
-        pts = cv2.goodFeaturesToTrack(
-            ref_u8_filt,
-            maxCorners=int(num_points),
-            qualityLevel=0.01,
-            minDistance=float(min_dist),
-            blockSize=7,
-            useHarrisDetector=False,
-            mask=m,
-        )
-        if pts is None:
-            return np.zeros((0, 2), dtype=np.float32)
-        pts = pts.reshape(-1, 2).astype(np.float32)
-        return self._clip_border(pts, H, W, border=0)
+        return _presets.preset_features(ref_u8_filt, num_points=num_points, min_dist=min_dist)
 
     def _preset_activity(self, gray_video, num_points=200, min_dist=15):
-        """Generate points in regions of high intensity change (activity)."""
-        H, W = gray_video.shape[1], gray_video.shape[2]
-        t_size = gray_video.shape[0]
-        if t_size < 2:
-            return np.zeros((0, 2), dtype=np.float32)
-
-        diffs = np.abs(gray_video[1:] - gray_video[:-1])
-        act = diffs.mean(axis=0)
-        act_u8 = cv2.normalize(act, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-        act_u8 = cv2.GaussianBlur(act_u8, (0, 0), 1.0)
-
-        _, m = cv2.threshold(act_u8, 0, 255, cv2.THRESH_OTSU)
-        m = cv2.medianBlur(m, 5)
-
-        pts = cv2.goodFeaturesToTrack(
-            act_u8,
-            maxCorners=int(num_points),
-            qualityLevel=0.01,
-            minDistance=float(min_dist),
-            blockSize=7,
-            useHarrisDetector=False,
-            mask=m,
-        )
-        if pts is None:
-            return np.zeros((0, 2), dtype=np.float32)
-        pts = pts.reshape(-1, 2).astype(np.float32)
-        return self._clip_border(pts, H, W, border=0)
+        return _presets.preset_activity(gray_video, num_points=num_points, min_dist=min_dist)
 
     def _preset_segmentation_centroids(self, ref_u8_filt, num_points=200):
-        """Generate points based on centroids of segmented image components."""
-        H, W = ref_u8_filt.shape[:2]
-        _, bw = cv2.threshold(ref_u8_filt, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        bw = cv2.medianBlur(bw, 5)
-        bw = cv2.morphologyEx(
-            bw, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1
+        return _presets.preset_segmentation(ref_u8_filt, num_points=num_points)
+
+    def _preset_matchanything(self, frame_u8, ref_u8, num_points=200, min_score=0.2, min_dist=10):
+        return _presets.preset_matchanything(
+            frame_u8,
+            ref_u8,
+            num_points=num_points,
+            min_score=min_score,
+            min_dist=min_dist,
+            status_cb=self.status_label.setText,
         )
 
-        num_labels, _, stats, centroids = cv2.connectedComponentsWithStats(
-            bw, connectivity=8
-        )
-        if num_labels <= 1:
-            return np.zeros((0, 2), dtype=np.float32)
-
-        areas = stats[1:, cv2.CC_STAT_AREA]
-        cent = centroids[1:].astype(np.float32)
-
-        order = np.argsort(-areas)
-        cent = cent[order][: int(num_points)]
-        cent = self._clip_border(cent, H, W, border=0)
-        return cent
-
-    def _preset_matchanything(
-        self,
-        frame_u8,
-        ref_u8,
-        num_points=200,
-        min_score=0.2,
-        min_dist=10,
-    ):
-        """
-        Generate preset points from MatchAnything correspondences.
-
-        Returns points in the reference frame so it matches the behavior of the
-        other preset methods, which return (N, 2) point coordinates.
-        """
-
-        def _fallback_points():
-            # Safe fallback when MatchAnything is not available.
-            return self._preset_features(
-                ref_u8,
-                num_points=int(num_points),
-                min_dist=float(min_dist),
-            )
-
-        if (
-            Image is None
-            or AutoImageProcessor is None
-            or AutoModelForKeypointMatching is None
-            or not self.matchanything_available
-        ):
-            self.status_label.setText(
-                "MatchAnything dependencies unavailable. Using fallback points."
-            )
-            return _fallback_points()
-
-        def _to_pil_rgb(img):
-            arr = np.asarray(img)
-
-            if arr.ndim == 2:
-                arr = arr.astype(np.float32)
-                mn, mx = float(np.nanmin(arr)), float(np.nanmax(arr))
-                if mx > mn:
-                    arr = (arr - mn) / (mx - mn) * 255.0
-                arr = np.clip(arr, 0, 255).astype(np.uint8)
-                arr = np.repeat(arr[..., None], 3, axis=-1)
-                return Image.fromarray(arr)
-
-            if arr.ndim == 3 and arr.shape[-1] == 1:
-                arr = arr[..., 0].astype(np.float32)
-                mn, mx = float(np.nanmin(arr)), float(np.nanmax(arr))
-                if mx > mn:
-                    arr = (arr - mn) / (mx - mn) * 255.0
-                arr = np.clip(arr, 0, 255).astype(np.uint8)
-                arr = np.repeat(arr[..., None], 3, axis=-1)
-                return Image.fromarray(arr)
-
-            if arr.ndim == 3 and arr.shape[-1] == 3:
-                arr = arr.astype(np.float32)
-                mn, mx = float(np.nanmin(arr)), float(np.nanmax(arr))
-                if mx > mn:
-                    arr = (arr - mn) / (mx - mn) * 255.0
-                arr = np.clip(arr, 0, 255).astype(np.uint8)
-                return Image.fromarray(arr)
-
-            raise ValueError(f"Unsupported image shape: {arr.shape}")
-
-        # Lazy-load MatchAnything on first use
-        if self.matchanything is None:
-            try:
-                model_name = "zju-community/matchanything_eloftr"
-                # Keep preset path stable by defaulting to CPU here.
-                device = "cpu"
-
-                self.matchanything_device = device
-                self.matchanything_processor = AutoImageProcessor.from_pretrained(
-                    model_name
-                )
-                self.matchanything = AutoModelForKeypointMatching.from_pretrained(
-                    model_name
-                )
-                self.matchanything.eval().to(device)
-
-            except Exception as e:
-                self.matchanything_available = False
-                self.status_label.setText(
-                    f"MatchAnything model not available: {e}. Using fallback points."
-                )
-                return _fallback_points()
-
-        H, W = ref_u8.shape[:2]
-
-        try:
-            img0 = _to_pil_rgb(frame_u8)  # current frame
-            img1 = _to_pil_rgb(ref_u8)  # reference frame
-
-            inputs = self.matchanything_processor([img0, img1], return_tensors="pt")
-            inputs = {k: v.to(self.matchanything_device) for k, v in inputs.items()}
-
-            with torch.inference_mode():
-                if str(self.matchanything_device).startswith("cuda"):
-                    with torch.autocast(device_type="cuda", dtype=torch.float16):
-                        outputs = self.matchanything(**inputs)
-                else:
-                    outputs = self.matchanything(**inputs)
-
-            result = self.matchanything_processor.post_process_keypoint_matching(
-                outputs,
-                [[(img0.height, img0.width), (img1.height, img1.width)]],
-                threshold=float(min_score),
-            )[0]
-
-            points0 = result["keypoints0"].detach().cpu().numpy().astype(np.float32)
-            points1 = result["keypoints1"].detach().cpu().numpy().astype(np.float32)
-            scores = result["matching_scores"].detach().cpu().numpy().astype(np.float32)
-
-        except Exception as e:
-            self.matchanything_available = False
-            self.status_label.setText(
-                f"MatchAnything inference failed: {e}. Using fallback points."
-            )
-            return _fallback_points()
-
-        if points1 is None or len(points1) == 0:
-            return np.zeros((0, 2), dtype=np.float32)
-
-        keep = scores >= float(min_score)
-        points1 = points1[keep]
-        scores = scores[keep]
-
-        if len(points1) == 0:
-            return np.zeros((0, 2), dtype=np.float32)
-
-        order = np.argsort(-scores)
-        points1 = points1[order]
-
-        # Keep a spatially diverse subset using minimum inter-point distance.
-        min_dist_px = float(max(0.0, min_dist))
-        if min_dist_px > 0:
-            selected = []
-            thr2 = min_dist_px * min_dist_px
-            for p in points1:
-                if not selected:
-                    selected.append(p)
-                else:
-                    q = np.asarray(selected, dtype=np.float32)
-                    d2 = np.sum((q - p) ** 2, axis=1)
-                    if float(np.min(d2)) >= thr2:
-                        selected.append(p)
-                if len(selected) >= int(num_points):
-                    break
-            if not selected:
-                return np.zeros((0, 2), dtype=np.float32)
-            points1 = np.asarray(selected, dtype=np.float32)
-        else:
-            points1 = points1[: int(num_points)]
-
-        points1 = self._clip_border(points1, H, W, border=0)
-        return points1.astype(np.float32)
-
-    def _preset_regular_grid(
-        self, H, W, rows, cols, spacing_px=0, offset_x=0, offset_y=0
-    ):
-        """Generate a centered rectangular grid avoiding borders.
-
-        Keeps the number of points fixed (rows×cols). The optional spacing_px
-        increases the distance between points equally by adding extra margin
-        on all sides without introducing new points. The optional offset_x/offset_y
-        shifts the grid center relative to the image center.
-        """
-        rows = max(2, int(rows))
-        cols = max(2, int(cols))
-
-        # Base dynamic margin proportional to density, modified by user spacing.
-        # Positive spacing reduces margins -> larger interior -> points farther apart.
-        # Negative spacing increases margins -> smaller interior -> points closer.
-        base_mx = max(5.0, float(W) / float(cols + 1))
-        base_my = max(5.0, float(H) / float(rows + 1))
-        extra = float(spacing_px)
-        margin_x = max(1.0, base_mx - extra)
-        margin_y = max(1.0, base_my - extra)
-
-        # Clamp margins to ensure a valid interior area (cannot exceed half-size)
-        margin_x = min(margin_x, max(1.0, float(W) / 2.0 - 1.0))
-        margin_y = min(margin_y, max(1.0, float(H) / 2.0 - 1.0))
-
-        start_x = margin_x
-        end_x = float(W) - margin_x
-        start_y = margin_y
-        end_y = float(H) - margin_y
-
-        # If margins consume too much area, fall back to minimal interior
-        if end_x <= start_x:
-            start_x = 1.0
-            end_x = float(W) - 1.0
-        if end_y <= start_y:
-            start_y = 1.0
-            end_y = float(H) - 1.0
-
-        xs = np.linspace(start_x, end_x, cols, dtype=np.float32)
-        ys = np.linspace(start_y, end_y, rows, dtype=np.float32)
-
-        # Apply center offsets and clamp to image bounds
-        xs = xs + float(offset_x)
-        ys = ys + float(offset_y)
-        xs = np.clip(xs, 1.0, float(W) - 1.0).astype(np.float32)
-        ys = np.clip(ys, 1.0, float(H) - 1.0).astype(np.float32)
-        gx, gy = np.meshgrid(xs, ys)
-        return np.stack([gx.reshape(-1), gy.reshape(-1)], axis=-1)
+    def _preset_regular_grid(self, H, W, rows, cols, spacing_px=0, offset_x=0, offset_y=0):
+        return _presets.preset_regular_grid(H, W, rows, cols, spacing_px=spacing_px, offset_x=offset_x, offset_y=offset_y)
 
     def _preset_regular_grid_spacing(self, H: int, W: int, spacing_px: int):
-        """Generate a centered rectangular grid using a fixed pixel spacing.
-
-        Ensures at least two points per axis. Keeps points away from borders
-        by half-spacing margin and centers the grid when leftover slack exists.
-        """
-        s = max(1.0, float(spacing_px))
-
-        # Half-spacing margin from each border, but keep at least 5px
-        margin_x = max(5.0, s / 2.0)
-        margin_y = max(5.0, s / 2.0)
-
-        # Compute how many samples fit with margins
-        usable_w = max(0.0, float(W) - 2.0 * margin_x)
-        usable_h = max(0.0, float(H) - 2.0 * margin_y)
-        cols = max(2, int(np.floor(usable_w / s)) + 1)
-        rows = max(2, int(np.floor(usable_h / s)) + 1)
-
-        # Center start positions so grid is centered within image
-        total_w = (cols - 1) * s
-        total_h = (rows - 1) * s
-        start_x = (float(W) - total_w) / 2.0
-        start_y = (float(H) - total_h) / 2.0
-        # Clamp starts to respect minimal margin
-        start_x = max(margin_x, start_x)
-        start_y = max(margin_y, start_y)
-        end_x = start_x + total_w
-        end_y = start_y + total_h
-        end_x = min(float(W) - margin_x, end_x)
-        end_y = min(float(H) - margin_y, end_y)
-
-        # Recompute starts if clamped ends reduced coverage
-        total_w = end_x - start_x
-        total_h = end_y - start_y
-        if cols > 1:
-            s_x = total_w / (cols - 1)
-        else:
-            s_x = s
-        if rows > 1:
-            s_y = total_h / (rows - 1)
-        else:
-            s_y = s
-
-        xs = (start_x + np.arange(cols, dtype=np.float32) * s_x).astype(np.float32)
-        ys = (start_y + np.arange(rows, dtype=np.float32) * s_y).astype(np.float32)
-        gx, gy = np.meshgrid(xs, ys)
-        return np.stack([gx.reshape(-1), gy.reshape(-1)], axis=-1)
+        return _presets.preset_regular_grid_spacing(H, W, spacing_px)
 
     def apply_point_preset(self, mode="replace", keep_custom=False):
         """
