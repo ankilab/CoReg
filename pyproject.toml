@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "coreg"             # this is the *pip install name* (can be whatever)
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "pyqtgraph",
+    "opencv-python",
+    "PyQt6>=6.6,<6.10",
+    "torch",
+    "torchvision",
+    "pillow",
+    "imageio",
+    "matplotlib",
+    "scipy",
+    "tifffile",
+    "h5py",
+    "hdf5plugin",
+    "scikit-image",
+    "nibabel",
+    "imageio[pyav]",
+    "imageio[ffmpeg]",
+    "pyflowreg",
+    "jnormcorre",
+    "antspyx",
+    "tqdm",
+    "transformers",
+    ]
+
+[tool.setuptools]
+package-dir = {"" = "src/CoReg"}
+py-modules = ["gui", "cli", "cli_baseline", "metrics_common"]
+
+[tool.setuptools.packages.find]
+where = ["src/CoReg"]
+include = ["cotracker*", "utils*", "train*"]
+
+[project.scripts]
+coreg-gui = "gui:main"
+coreg-cli = "cli:main"
+coreg-baseline = "cli_baseline:main"
+
+[tool.black]
+line-length = 88
+target-version = ['py310']
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | _build
+  | buck-out
+  | build
+  | dist
+)/
+'''

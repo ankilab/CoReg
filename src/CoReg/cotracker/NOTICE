@@ -1,0 +1,16 @@
+This directory (src/CoReg/cotracker/) is vendored from Meta's CoTracker
+project:
+
+    https://github.com/facebookresearch/co-tracker
+    Copyright (c) Meta Platforms, Inc. and affiliates.
+
+It is licensed under the Creative Commons Attribution-NonCommercial 4.0
+International License (CC BY-NC 4.0) -- see the LICENSE file in this
+directory for the full text. This is NOT the same license as the rest of
+this repository (see the root-level LICENSE, Apache License 2.0) and it
+is NOT covered by that license: CC BY-NC 4.0 permits use, modification,
+and redistribution only for non-commercial purposes, and requires
+attribution to Meta Platforms, Inc.
+
+Any commercial use of this repository must exclude or replace this
+directory.

@@ -1,0 +1,27 @@
+# Exact versions this project was verified to install and run with
+# (GUI launch, LDDMM/CoTracker registration, CLI --help) as of 2026-09-30.
+# pyproject.toml's own dependency list is intentionally left unpinned for
+# installability; this file is the "known-working" reference environment.
+numpy==2.3.5
+pyqtgraph==0.14.0
+opencv-python==4.13.0.92
+PyQt6==6.9.1
+torch==2.12.0
+torchvision==0.27.0
+pillow==12.2.0
+imageio[pyav,ffmpeg]==2.37.3
+matplotlib==3.10.9
+scipy==1.15.3
+tifffile==2026.5.15
+h5py==3.16.0
+hdf5plugin==6.0.0
+scikit-image==0.26.0
+nibabel==5.4.2
+pyflowreg==0.1.0a9
+jnormcorre==1.0.0
+antspyx==0.6.3
+tqdm==4.67.3
+# Only needed for the optional "matchanything" CoTracker preset (soft
+# import, see utils/presets.py); not part of the verified set above since
+# it isn't installed in the environment this file was generated from.
+transformers

@@ -1,0 +1,79 @@
+# Known-working reference env for napari-coreg, deliberately separate from
+# the main project's requirements.txt (that one installs PyQt6 + the
+# baseline-method deps this plugin never touches).
+#
+# The pinned versions below for numpy/opencv/torch/.../scikit-image are
+# copied straight from ../requirements.txt -- that file is the *verified*
+# set this exact CoTracker/warping code (utils/mc_cotracker.py,
+# utils/cotracker_pipeline.py, the vendored cotracker/ package) runs with,
+# so matching them here avoids a second, independently-drifted set of
+# pins for the same code path. napari/magicgui are NOT similarly verified
+# yet -- no install of this requirements.txt has been run end-to-end in
+# napari -- so they're left as minimum-version constraints, not exact pins.
+#
+# Plain "napari" ships with no Qt backend at all (it errors with "No Qt
+# bindings could be found" on launch) -- pick one via an extra. PySide6
+# here, not PyQt6, so this env's Qt binding never shares a name with the
+# main GUI's PyQt6==6.9.1 pin even by coincidence (they're separate envs
+# either way, but this removes the ambiguity entirely).
+
+napari[pyside6]>=0.5
+magicgui>=0.9
+
+numpy==2.3.5
+# opencv-python (not -headless) bundles its own Qt platform plugins for
+# cv2.imshow()-style GUI calls -- loading those alongside napari's own Qt
+# backend (PySide6, above) in the same process is a well-known cause of a
+# silent segfault on widget load. None of the code this plugin runs
+# (mc_cotracker.py/utils.py/presets.py) uses any cv2 GUI function, so the
+# headless wheel is a drop-in replacement here.
+opencv-python-headless==4.13.0.92
+# PyPI's plain torch==2.12.0/torchvision==0.27.0 resolve to the +cu130
+# build (needs a driver supporting CUDA 13.0). This machine's driver is
+# 575.57.08 (CUDA 12.9 capability) -- too old for that build, which fails
+# at actual CUDA init with "RuntimeError: The NVIDIA driver on your
+# system is too old" (torch.cuda.is_available() papers over this with a
+# warning + CPU fallback, but e.g. picking "cuda" explicitly in the
+# widget's device dropdown hits the hard error). Pin the +cu126 build
+# explicitly instead -- confirmed working on this GPU (RTX A5000) -- and
+# pull it from PyTorch's own index via --extra-index-url below; the local
+# version suffix in the pin (+cu126) is what makes pip match that exact
+# build instead of silently keeping an already-installed +cu130 one.
+--extra-index-url https://download.pytorch.org/whl/cu126
+torch==2.12.0+cu126
+torchvision==0.27.0+cu126
+pillow==12.2.0
+imageio[pyav,ffmpeg]==2.37.3
+matplotlib==3.10.9
+scipy==1.15.3
+tifffile==2026.5.15
+h5py==3.16.0
+hdf5plugin==6.0.0
+scikit-image==0.26.0
+tqdm==4.67.3
+
+# Only needed for the optional "matchanything" CoTracker preset (soft
+# import in utils/presets.py); this plugin's widget doesn't expose that
+# preset yet, so it's not required, but kept here to match the main env.
+transformers
+
+# torch bundles "triton" as an optional dependency for torch.compile/
+# inductor, which this project's tracking path (utils/mc_cotracker.py,
+# cotracker/predictor.py) never uses. Keep it uninstalled in this env:
+# importing torchvision (which eagerly touches torchvision.ops, which in
+# turn imports torch._dynamo, which tries "import triton") segfaults
+# inside triton/knobs.py as soon as napari's real OpenGL canvas is already
+# active in the process -- reproduced directly on this machine. With
+# triton absent, torch._dynamo's own try/except ImportError around that
+# import just reports triton unavailable instead of crashing; nothing
+# here needs torch.compile. If a later `pip install` silently pulls
+# triton back in as a transitive dependency, re-run:
+#   pip uninstall -y triton
+
+# Install the main 'coreg' package itself separately, WITHOUT its own
+# dependency list (which pulls in PyQt6, antspyx, jnormcorre, pyflowreg --
+# none of which utils.cotracker_pipeline/utils.presets/utils.mc_cotracker
+# actually import), e.g.:
+#   pip install --no-deps -e /path/to/registration_gui
+#   pip install -r requirements.txt
+#   pip install -e .   # this napari-coreg package itself

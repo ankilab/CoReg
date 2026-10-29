@@ -1,0 +1,10 @@
+name: napari-coreg
+display_name: CoReg
+contributions:
+  commands:
+    - id: napari-coreg.make_widget
+      python_name: napari_coreg._widget:make_coreg_widget
+      title: Open CoReg motion-correction widget
+  widgets:
+    - command: napari-coreg.make_widget
+      display_name: CoReg Motion Correction

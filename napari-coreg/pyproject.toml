@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "napari-coreg"
+version = "0.1.0"
+description = "napari widget for CoReg's CoTracker-based motion correction"
+requires-python = ">=3.10"
+dependencies = [
+    "napari>=0.5",
+    "magicgui",
+    "numpy",
+    "torch",
+    # "coreg" (this repo's src/CoReg) is NOT listed here -- it isn't on PyPI
+    # and a path dependency wouldn't survive moving either repo. Install it
+    # yourself first (see README.md); this plugin only imports its headless
+    # utils.* modules and fails at widget-creation time with a clear message
+    # if they aren't importable.
+]
+
+[project.entry-points."napari.manifest"]
+napari-coreg = "napari_coreg:napari.yaml"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+napari_coreg = ["napari.yaml"]
