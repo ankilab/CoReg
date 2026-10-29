@@ -10,7 +10,7 @@ Motion correction for in vivo calcium imaging. Point-based tracking (CoTracker) 
 <p align="center"><sub>
 Input &middot; tracked points (CoReg) &middot; motion-corrected output, at three timestamps of a
 10 s, two-photon calcium recording. Full video and more examples on the
-<a href="https://neuluna.github.io/registration_gui/">project page</a>.
+<a href="https://ankilab.github.io/CoReg/">project page</a>.
 </sub></p>
 
 ---
